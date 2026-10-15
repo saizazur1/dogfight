@@ -1,0 +1,25 @@
+{
+ "file": "hunza_cop30_n36e074.png",
+ "encoding": "uint16: height_m = min_m + v/65535*(max_m-min_m)",
+ "width": 4096,
+ "height": 4096,
+ "north_lat": 36.84,
+ "south_lat": 35.76,
+ "west_lon": 73.93,
+ "east_lon": 75.27,
+ "row0": "north",
+ "min_m": 1251.0,
+ "max_m": 7861.2080078125,
+ "metres_per_pixel_x": 29.35,
+ "metres_per_pixel_y": 29.25,
+ "extent_km": [
+  120.2,
+  119.8
+ ],
+ "centre": [
+  36.3,
+  74.6
+ ],
+ "source": "Copernicus DEM GLO-30 (copernicus-dem-30m), mosaic of the 8 tiles in dem/raw (N37 E073 not downloaded, outside the crop); bilinear downsample; metres/px uses cos(36.3deg)",
+ "credit": "Contains modified Copernicus DEM data © DLR e.V. 2010–2014 and © Airbus Defence and Space GmbH 2014–2018, provided under COPERNICUS by the European Union and ESA; all rights reserved"
+}

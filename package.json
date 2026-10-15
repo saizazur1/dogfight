@@ -1,0 +1,10 @@
+{
+  "name": "dogfight-io",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "serve": "python3 -m http.server 8320 --bind 127.0.0.1",
+    "check": "node js/flight.check.mjs"
+  },
+  "devDependencies": { "three": "0.186.0" }
+}
