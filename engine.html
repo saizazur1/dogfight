@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Engine bench</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; font: 12px/1.4 system-ui, sans-serif; color: #ddd; }
+  canvas { display: block; width: 100%; height: 100%; }
+  #load { position: fixed; inset: 0; display: grid; place-items: center; background: #05070a; color: #cfd8e3; z-index: 40; font-size: 14px; }
+  #load.gone { display: none; }
+  #credit { position: fixed; left: 8px; right: 8px; bottom: 4px; font-size: 10px; color: #fffa; text-shadow: 0 0 2px #000; pointer-events: none; }
+</style>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.186.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.186.0/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="load">Loading…</div>
+<div id="credit"></div>
+<script type="module">
+// Bench for js/engine.js: the real world + the real jet flying a scripted banked circle, a follow camera, ?perf=1 forced on.
+// ?nan=1 puts a NaN-emitting quad on screen (with ?nanguard=0 to see what the bloom does without the guard).
+// window.__engine / window.__ready are read by tools/perf.mjs.
+import * as THREE from 'three';
+import { createEngine } from './js/engine.js';
+import { buildJetWorld } from './js/jetworld.js';
+import { buildJet } from './js/jetmodel.js';
+import { poseMatrix, quatFromEuler, qRot, G } from './js/jetspec.js';
+
+const params = new URLSearchParams(location.search);
+if (!params.has('perf')) params.set('perf', '1');
+const loadEl = document.getElementById('load');
+const status = (s) => { loadEl.textContent = s; };
+
+try {
+  const engine = await createEngine({ canvas: document.getElementById('c'), params });
+  window.__engine = engine;
+  const { scene, camera } = engine;
+
+  status('Building the world…');
+  const world = await buildJetWorld(scene, engine.renderer, { seed: +(params.get('seed') || 7) });
+  engine.configure({ bloom: world.bloom, exposure: world.exposure });   // the film kept AgX: world.toneMapping (ACES) is not passed
+  document.getElementById('credit').textContent = world.credit || '';
+
+  status('Building the jet…');
+  const jet = buildJet(0, { screenLight: false });
+  world.applyEnv(jet.group);
+  scene.add(jet.group);
+
+  if (params.get('nan') === '1') {   // a 5% square that outputs NaN (0/0 through a uniform, so the compiler cannot fold it)
+    const nanMat = new THREE.ShaderMaterial({
+      uniforms: { uZero: { value: 0 }, uNeg: { value: -1 } }, depthTest: false, depthWrite: false,
+      vertexShader: 'void main() { gl_Position = vec4(position.xy * 0.05 + vec2(0.3, 0.0), 0.0, 1.0); }',
+      fragmentShader: (params.get('nan') === '1' && params.get('kind') === 'sqrt' ? 'uniform float uNeg; void main() { float n = sqrt(uNeg) + pow(uNeg, 0.5); gl_FragColor = vec4(n, n, n, 1.0); }' : 'uniform float uZero; void main() { float n = uZero / uZero; gl_FragColor = vec4(n, n, n, 1.0); }'),
+    });
+    const quad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), nanMat);
+    quad.frustumCulled = false; quad.renderOrder = 999;
+    scene.add(quad);
+  }
+
+  // ---- the scripted flight: a constant-rate right turn, a pure function of t (x = x0 + R (cos h0 - cos h), z = z0 + R (sin h0 - sin h))
+  const V = 150, BANK = Math.PI / 3, R = V * V / (G * Math.tan(BANK)), W = V / R;
+  const sp = world.spawn ?? null;
+  const p0 = sp ? sp.pos : [0, world.terrainHeightAt(0, 0) + 300, 0];
+  const h0 = sp ? sp.heading : 0;
+  let clearY = p0[1];
+  for (let k = 0; k < 90; k++) {   // fly the circle high enough to clear the ground all the way round
+    const h = h0 + k / 90 * 2 * Math.PI;
+    clearY = Math.max(clearY, world.terrainHeightAt(p0[0] + R * (Math.cos(h0) - Math.cos(h)), p0[2] + R * (Math.sin(h0) - Math.sin(h))) + 120);
+  }
+  const prevP = [0, 0, 0], curP = [0, 0, 0], prevQ = [0, 0, 0, 1], curQ = [0, 0, 0, 1];
+  const Z = [0, 0, 1], outP = [0, 0, 0], outQ = [0, 0, 0, 1], fwd = [0, 0, 0], m16 = new Array(16).fill(0);
+  let simT = 0;
+  const pose = (t, p, q) => {
+    const h = h0 + W * t;
+    p[0] = p0[0] + R * (Math.cos(h0) - Math.cos(h)); p[1] = clearY; p[2] = p0[2] + R * (Math.sin(h0) - Math.sin(h));
+    quatFromEuler(h, 0, BANK, q);
+  };
+  pose(0, curP, curQ);
+  const camPos = new THREE.Vector3(), camGoal = new THREE.Vector3(), look = new THREE.Vector3();
+  const aim = (alpha, dt, snap) => {
+    for (let i = 0; i < 3; i++) outP[i] = prevP[i] + (curP[i] - prevP[i]) * alpha;
+    const dot = prevQ[0] * curQ[0] + prevQ[1] * curQ[1] + prevQ[2] * curQ[2] + prevQ[3] * curQ[3], sg = dot < 0 ? -1 : 1;
+    let l = 0;
+    for (let i = 0; i < 4; i++) { outQ[i] = prevQ[i] + (curQ[i] * sg - prevQ[i]) * alpha; l += outQ[i] * outQ[i]; }
+    l = Math.sqrt(l) || 1; for (let i = 0; i < 4; i++) outQ[i] /= l;
+    jet.group.matrix.fromArray(poseMatrix(outP, outQ, m16)); jet.group.matrixWorldNeedsUpdate = true;
+    qRot(outQ, Z, fwd);
+    camGoal.set(outP[0] - fwd[0] * 38, outP[1] - fwd[1] * 38 + 9, outP[2] - fwd[2] * 38);
+    if (snap) camPos.copy(camGoal); else camPos.lerp(camGoal, 1 - Math.exp(-6 * dt));
+    camera.position.copy(camPos);
+    look.set(outP[0] + fwd[0] * 25, outP[1] + fwd[1] * 25 + 2, outP[2] + fwd[2] * 25);
+    camera.lookAt(look);
+  };
+  const step = (dt) => {
+    prevP[0] = curP[0]; prevP[1] = curP[1]; prevP[2] = curP[2];
+    prevQ[0] = curQ[0]; prevQ[1] = curQ[1]; prevQ[2] = curQ[2]; prevQ[3] = curQ[3];
+    simT += dt; pose(simT, curP, curQ);
+  };
+  const frame = (alpha, dt) => { aim(alpha, dt, false); world.update(simT, camera); };
+
+  // ---- warm-up: the chase view, the sun glare (bloom), the ground below
+  const sun = world.sunDir;
+  const look3 = (x, y, z, tx, ty, tz) => { camera.position.set(x, y, z); camera.lookAt(tx, ty, tz); world.update(0, camera); };
+  status('Warming up the effects…');
+  pose(0, prevP, prevQ); curP[0] = prevP[0]; curP[1] = prevP[1]; curP[2] = prevP[2]; curQ[0] = prevQ[0]; curQ[1] = prevQ[1]; curQ[2] = prevQ[2]; curQ[3] = prevQ[3];
+  await engine.warmUp([
+    () => { aim(1, 0, true); world.update(0, camera); },
+    () => look3(p0[0], clearY + 20, p0[2], p0[0] + sun.x * 1000, clearY + 20 + sun.y * 1000, p0[2] + sun.z * 1000),
+    () => look3(p0[0], clearY + 600, p0[2], p0[0], clearY, p0[2] - 50),
+  ]);
+
+  aim(1, 0, true);
+  if (params.get('busy') !== '0') { engine.setBusy(true); setInterval(() => engine.calm(), 5000); }   // 'action' with a calm moment every 5 s (a respawn); ?busy=0 exercises the 2.5 s flush
+  engine.run(step, frame);
+  window.__ready = true;
+  loadEl.classList.add('gone');
+  console.info(`[bench] ready: circle R ${R.toFixed(0)} m, y ${clearY.toFixed(0)}, spawn ${sp ? 'world.spawn' : 'fallback'}, tone ${engine.renderer.toneMapping}, gpu timer ${engine.stats.gpuMs === null ? 'pending' : 'on'}`);
+} catch (e) {
+  console.error('[bench] failed:', e && e.stack || e);
+  status('Failed: ' + (e && e.message || e));
+}
+</script>
+</body>
+</html>

@@ -1,0 +1,205 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>World bench</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; font: 12px/1.4 system-ui, sans-serif; color: #ddd; }
+  canvas { display: block; width: 100%; height: 100%; }
+  #bar { position: fixed; left: 8px; top: 8px; display: flex; gap: 4px; flex-wrap: wrap; }
+  #bar button { background: #0009; color: #eee; border: 1px solid #fff3; border-radius: 4px; padding: 3px 8px; cursor: pointer; }
+  #info { position: fixed; left: 8px; bottom: 22px; background: #0008; padding: 3px 6px; border-radius: 4px; white-space: pre; max-width: calc(100% - 16px); overflow: hidden; }
+  #perf { position: fixed; right: 8px; top: 8px; background: #000a; padding: 4px 8px; border-radius: 4px; font: 12px/1.3 ui-monospace, monospace; white-space: pre; display: none; }
+  #credit { position: fixed; left: 8px; right: 8px; bottom: 4px; font-size: 10px; color: #fffa; text-shadow: 0 0 2px #000; }
+</style>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.186.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.186.0/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="bar"></div>
+<div id="info">loading…</div>
+<div id="perf"></div>
+<div id="credit"></div>
+<script type="module">
+// Bench for js/jetworld.js (lane WORLD).
+//   ?view=spawn|far|sun|down|under|inDeck|cloud   ?t=seconds (cloud drift)   ?seed=   ?free=1 (orbit controls)
+//   ?hide=cloudSea,cumulus,terrainNear,terrainFar   ?q=0..2 (world.setQuality)
+//   ?perf=1: holds the view, animates t, prints fps + GPU ms medians (EXT_disjoint_timer_query_webgl2; a gl.finish-style
+//   sync time when the extension is missing). The renderer is the game's: pixel ratio <= 1.5, AgX, log depth, no MSAA on
+//   the canvas, a half-float composer with UnrealBloomPass at half size (copied from the film's main.js).
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+import { buildJetWorld, SUN } from './js/jetworld.js';
+
+const q = new URLSearchParams(location.search);
+const PERF = q.has('perf');
+const canvas = document.getElementById('c');
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: false, logarithmicDepthBuffer: true, powerPreference: 'high-performance' });
+const PIXEL_CAP = 1.5;
+renderer.setPixelRatio(Math.min(devicePixelRatio || 1, PIXEL_CAP));
+renderer.setSize(innerWidth, innerHeight, false);
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 0.5, 400000);
+const world = await buildJetWorld(scene, renderer, { seed: +(q.get('seed') || 7) });
+if (q.has('q')) world.setQuality?.(+q.get('q'));
+if (q.has('nohiz')) world.hiZ = false;
+renderer.toneMapping = { aces: THREE.ACESFilmicToneMapping, agx: THREE.AgXToneMapping }[q.get('tone') || (PERF ? 'agx' : '')] ?? world.toneMapping;
+renderer.toneMappingExposure = +(q.get('exp') || world.exposure);
+document.getElementById('credit').textContent = world.credit || '';
+for (const n of (q.get('hide') || '').split(',').filter(Boolean)) world.group.traverse((o) => { if (o.name === n) o.visible = false; });
+
+// the composer (main.js L79-114 of the film): half-float MSAA target, bloom at half size, output pass
+const target = new THREE.WebGLRenderTarget(1, 1, { type: THREE.HalfFloatType, samples: 4 });
+const composer = new EffectComposer(renderer, target);
+composer.addPass(new RenderPass(scene, camera));
+const bloom = new UnrealBloomPass(new THREE.Vector2(256, 256), world.bloom.strength, world.bloom.radius, world.bloom.threshold);
+composer.addPass(bloom);
+composer.addPass(new OutputPass());
+function resize() {
+  const w = innerWidth, h = innerHeight;
+  renderer.setSize(w, h, false);
+  composer.setPixelRatio(Math.min(devicePixelRatio || 1, PIXEL_CAP));
+  composer.setSize(w, h);
+  bloom.setSize(w / 2, h / 2);
+  camera.aspect = w / h; camera.updateProjectionMatrix();
+}
+addEventListener('resize', resize);
+resize();
+
+// a stand-in jet (grey, ~15 m), nose along its local +z
+const jet = new THREE.Group();
+{
+  const m = new THREE.MeshStandardMaterial({ color: 0x8a9096, metalness: 0.3, roughness: 0.45 });
+  jet.add(new THREE.Mesh(new THREE.CylinderGeometry(0.7, 0.9, 15, 16).rotateX(Math.PI / 2), m),
+    new THREE.Mesh(new THREE.BoxGeometry(11, 0.25, 4).translate(0, 0, -2), m),
+    new THREE.Mesh(new THREE.BoxGeometry(0.25, 3, 2.5).translate(0, 1.6, -6), m));
+  world.applyEnv(jet, 1);
+  scene.add(jet);
+}
+const jet2 = jet.clone(); jet2.visible = false; scene.add(jet2);   // the cloud view's second jet, deep inside the box
+
+// ---------------------------------------------------------------- views (world: x east, z south; heading clockwise from north)
+const DEG = Math.PI / 180, H = (x, z) => world.terrainHeightAt(x, z);
+const dirAz = (azDeg, elDeg) => { const a = azDeg * DEG, e = elDeg * DEG; return new THREE.Vector3(Math.sin(a) * Math.cos(e), Math.sin(e), -Math.cos(a) * Math.cos(e)); };
+// before the world had them (the film's jetworld.js), the bench used the same numbers
+const PA = world.playArea ?? { cx: -5500, cz: -3000, half: 15000, ceiling: 6000 };
+const SP = world.spawn ?? { pos: [4250, 900, 4500], heading: 310 * DEG, speed: 200 };
+// a straight run from (x, z) along az at height y: the first distance where the ground comes within 60 m (cap L)
+const clearRun = (x, z, y, az, L) => { const fx = Math.sin(az * DEG), fz = -Math.cos(az * DEG); for (let s = 50; s <= L; s += 50) if (H(x + fx * s, z + fz * s) > y - 60) return s; return L; };
+// the best low valley run near (x0, z0): low ground, 4 km clear at 180 m over it, the highest walls 0.6-3 km either side
+function valleyNear(x0, z0, R, maxFloor = 1e9, minDeck = -1e9) {
+  let best = null;
+  for (let x = x0 - R; x <= x0 + R; x += 500) for (let z = z0 - R; z <= z0 + R; z += 500) {
+    const g = H(x, z); if (g > maxFloor) continue;
+    if (world.deckTopAt && world.deckTopAt(x, z, +(q.get('t') || 0)) < minDeck) continue;
+    const y = g + 180;
+    for (let az = 0; az < 360; az += 10) {
+      if (clearRun(x, z, y, az, 4000) < 4000) continue;
+      const fx = Math.sin(az * DEG), fz = -Math.cos(az * DEG);
+      let L = -1e9, Rr = -1e9;
+      for (let s = 0; s <= 4000; s += 1000) for (let d = 800; d <= 2800; d += 500) { L = Math.max(L, H(x + fx * s - fz * d, z + fz * s + fx * d)); Rr = Math.max(Rr, H(x + fx * s + fz * d, z + fz * s - fx * d)); }
+      const walls = Math.min(L, Rr) - y;
+      if (!best || walls > best.walls) best = { x, z, y, az, walls };
+    }
+  }
+  return best;
+}
+const fwd = dirAz(SP.heading / DEG, 0);
+const far = valleyNear(PA.cx + 12000, PA.cz, 2500);
+// a valley floor under the cloud sea, where the sea is thick (deckTopAt; the film's world had no CPU twin of it)
+const low = valleyNear(PA.cx, PA.cz, 12000, world.deck.base - 150, world.deck.base + 250) ?? valleyNear(PA.cx, PA.cz, 9000, world.deck.base - 150);
+const cloud = (() => {   // the cumulus box nearest the spawn: the jet just inside its near face, the lens 150 m outside
+  const cs = world.cloudsAt(+(q.get('t') || 0));
+  if (!cs.length) return null;
+  let b = cs[0]; for (const c of cs) if (Math.hypot(c.c[0] - SP.pos[0], c.c[2] - SP.pos[2]) < Math.hypot(b.c[0] - SP.pos[0], b.c[2] - SP.pos[2])) b = c;
+  const d = new THREE.Vector3(b.c[0] - SP.pos[0], 0, b.c[2] - SP.pos[2]).normalize();
+  const ext = Math.min(b.half[0] / Math.max(Math.abs(d.x), 1e-6), b.half[2] / Math.max(Math.abs(d.z), 1e-6));   // centre to the box's side along d
+  const mid = new THREE.Vector3(b.c[0], b.c[1] - b.half[1] * 0.3, b.c[2]), face = mid.clone().addScaledVector(d, -ext), side = new THREE.Vector3(-d.z, 0, d.x);
+  // jet 1 40 m inside the box's near face (in front of the cloud's mass: must stay crisp), jet 2 at its middle, 60 m aside
+  return { pos: face.clone().addScaledVector(d, -150).toArray(), dir: d.clone(), fov: 40, jet: face.clone().addScaledVector(d, 40).addScaledVector(side, -40).toArray(), jetDir: side,
+    jet2: mid.clone().addScaledVector(side, 60).toArray() };
+})();
+const VIEWS = {
+  // behind the spawn point looking along the heading, as a chase camera would
+  spawn: { pos: new THREE.Vector3(...SP.pos).addScaledVector(fwd, -32).add(new THREE.Vector3(0, 8, 0)).toArray(), dir: fwd.clone().add(new THREE.Vector3(0, -0.06, 0)).normalize(), fov: 65, jet: SP.pos, jetDir: fwd },
+  far: far && { pos: [far.x, far.y, far.z], dir: dirAz(far.az, -2), fov: 65, jet: null },
+  sun: { pos: SP.pos, dir: dirAz(SUN.azDeg, 2), fov: 60, jet: new THREE.Vector3(...SP.pos).addScaledVector(dirAz(SUN.azDeg + 8, 1), 70).toArray(), jetDir: dirAz(SUN.azDeg + 40, 0) },
+  down: { pos: [SP.pos[0], H(SP.pos[0], SP.pos[2]) + 3000, SP.pos[2]], dir: dirAz(SP.heading / DEG, -50), fov: 60, jet: null },
+  under: low && { pos: [low.x, world.deck.base - 70, low.z], dir: dirAz(low.az, 4), fov: 65, jet: null },
+  inDeck: low && { pos: [low.x, (world.deck.base + world.deck.top) / 2, low.z], dir: dirAz(low.az, -1), fov: 65, jet: null },
+  cloud,
+};
+for (const k of Object.keys(VIEWS)) if (!VIEWS[k]) delete VIEWS[k];
+let viewName = q.get('view') || q.get('shot') || 'spawn';
+function setView(name) {
+  const s = VIEWS[name] || VIEWS.spawn; viewName = VIEWS[name] ? name : 'spawn';
+  camera.position.set(...s.pos); camera.fov = s.fov; camera.updateProjectionMatrix();
+  camera.lookAt(camera.position.clone().add(s.dir));
+  jet.visible = !!s.jet;
+  if (s.jet) { jet.position.set(...s.jet); jet.lookAt(jet.position.clone().add(s.jetDir)); }
+  jet2.visible = !!s.jet2;
+  if (s.jet2) { jet2.position.set(...s.jet2); jet2.lookAt(jet2.position.clone().add(s.jetDir)); }
+  const p = s.pos, g = H(p[0], p[2]);
+  info.textContent = `${viewName} · cam ${p.map(Math.round)} · ground ${Math.round(g)} (AGL ${Math.round(p[1] - g)}) · playArea ${JSON.stringify(PA)} · spawn ${JSON.stringify({ pos: SP.pos.map(Math.round), heading: +(SP.heading / DEG).toFixed(1), speed: SP.speed })}${world.playArea ? '' : ' (bench fallback)'}`;
+}
+const info = document.getElementById('info');
+const bar = document.getElementById('bar');
+let free = q.has('free'), controls = null;
+for (const k of Object.keys(VIEWS)) { const b = document.createElement('button'); b.textContent = k; b.onclick = () => { free = false; setView(k); }; bar.appendChild(b); }
+if (free) { controls = new OrbitControls(camera, canvas); camera.position.set(...SP.pos); controls.target.copy(camera.position).add(fwd.clone().multiplyScalar(300)); }
+else setView(viewName);
+
+// ---------------------------------------------------------------- ?perf=1: fps, GPU ms (median over the window)
+const perfEl = document.getElementById('perf');
+const gl = renderer.getContext(), tq = PERF && q.get('gpu') !== 'sync' ? gl.getExtension('EXT_disjoint_timer_query_webgl2') : null;
+const dbg = gl.getExtension('WEBGL_debug_renderer_info'), GPU_NAME = dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : '?';
+const pend = [], gpu = [], frame = [], px1 = new Uint8Array(4);
+const med = (a) => { if (!a.length) return NaN; const s = a.slice().sort((x, y) => x - y); return s[s.length >> 1]; };
+const WARM = 3000, SPAN = +(q.get('span') || 8000);
+let tLast = 0, tStart = 0, done = false;
+function perfFrame(now) {
+  if (!tStart) tStart = now;
+  if (tLast && now - tStart > WARM) frame.push(now - tLast);
+  tLast = now;
+  let qy = null;
+  if (tq) { qy = gl.createQuery(); gl.beginQuery(tq.TIME_ELAPSED_EXT, qy); }
+  const c0 = performance.now();
+  renderer.info.reset();
+  composer.render();
+  if (tq) { gl.endQuery(tq.TIME_ELAPSED_EXT); pend.push(qy); }
+  else { gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px1); if (now - tStart > WARM) gpu.push(performance.now() - c0); }
+  while (pend.length && gl.getQueryParameter(pend[0], gl.QUERY_RESULT_AVAILABLE)) {
+    const p = pend.shift(), ns = gl.getQueryParameter(p, gl.QUERY_RESULT); gl.deleteQuery(p);
+    if (!gl.getParameter(tq.GPU_DISJOINT_EXT) && now - tStart > WARM) gpu.push(ns / 1e6);
+  }
+  const r = { view: viewName, fps: +(1000 / med(frame)).toFixed(1), frameMs: +med(frame).toFixed(2), gpuMs: +med(gpu).toFixed(2), gpuSrc: tq ? 'timer' : 'sync', n: frame.length,
+    px: `${renderer.domElement.width}x${renderer.domElement.height}@${renderer.getPixelRatio()}`, tris: renderer.info.render.triangles, calls: renderer.info.render.calls, gpu: GPU_NAME };
+  perfEl.textContent = `${r.view}  ${r.fps} fps  frame ${r.frameMs} ms\nGPU ${r.gpuMs} ms (${r.gpuSrc})  ${r.px}\ntris ${r.tris}  calls ${r.calls}`;
+  if (!done && now - tStart > WARM + SPAN) { done = true; window.__perf = r; console.log('PERF ' + JSON.stringify(r)); }
+}
+if (PERF) { perfEl.style.display = 'block'; renderer.info.autoReset = false; }
+
+window.__wb = { world, VIEWS, setView, renderer, camera };
+const t0 = performance.now(), tFix = q.has('t') ? +q.get('t') : null;
+document.title = 'world ready';
+(function loop(now) {
+  requestAnimationFrame(loop);
+  const tt = tFix ?? (performance.now() - t0) / 1000;
+  controls?.update();
+  world.update(tt, camera);
+  if (PERF) perfFrame(now || performance.now()); else composer.render();
+})();
+</script>
+</body>
+</html>

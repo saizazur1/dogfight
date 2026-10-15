@@ -1,0 +1,200 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Flight Bench</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #0b1018; overflow: hidden; }
+  canvas { display: block; width: 100vw; height: 100vh; }
+  #hud { position: fixed; inset: 0; pointer-events: none; }
+  #msg { position: fixed; left: 50%; bottom: 70px; transform: translateX(-50%); color: #fff; opacity: .85;
+    font: 800 14px "Nunito", system-ui, sans-serif; letter-spacing: 1px; text-shadow: 0 1px 3px #000; text-align: center; }
+  #credit { position: fixed; right: 8px; bottom: 6px; color: #fff; opacity: .6; font: 11px system-ui, sans-serif; }
+</style>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.186.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.186.0/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hud"></div>
+<div id="msg">loading...</div>
+<div id="credit"></div>
+<script type="module">
+// flight.html -- the FLIGHT lane's bench: the real world and jet, flight.js at a fixed 120 Hz with interpolated rendering,
+// controls, chase cam and HUD. Params:
+//   ?flat=1               a simple procedural ground + sky instead of jetworld.js
+//   ?autopilot=1|turn     scripted aim: hard banked turns left and right (no human needed)
+//   ?autopilot=stall      slow, idle, aim high: stalls, the nose drops, recovers
+//   ?autopilot=pullup     low, level, at the nearest wall: PULL UP, then the crash
+//   ?autopilot=edge       the aim held out of the play area: RETURN TO BATTLE AREA, the turn-back
+//   ?freeze=<s>|bank|stall|pullUp   stop the simulation (rendering goes on) at that time or the first such moment
+import * as THREE from 'three';
+import { createJet, stepJet, jetModelState } from './js/flight.js';
+import { createControls } from './js/controls.js';
+import { createChaseCam } from './js/chasecam.js';
+import { createHud } from './js/hud.js';
+import { buildJet } from './js/jetmodel.js';
+import { poseMatrix, eulerOf } from './js/jetspec.js';
+
+const P = new URLSearchParams(location.search);
+const D2R = Math.PI / 180, DT = 1 / 120;
+const msg = document.getElementById('msg');
+const canvas = document.getElementById('c');
+
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: false, logarithmicDepthBuffer: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 1.5));
+renderer.setSize(innerWidth, innerHeight, false);
+renderer.toneMapping = THREE.AgXToneMapping;
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(68, innerWidth / innerHeight, 0.5, 4e5);
+addEventListener('resize', () => { renderer.setSize(innerWidth, innerHeight, false); camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix(); });
+
+// ---------------------------------------------------------------- the world (real, or ?flat=1)
+function flatWorld() {
+  const h = (x, z) => 600 + 900 * Math.max(0, Math.sin(x / 2300) * Math.cos(z / 2900)) ** 1.5 + 120 * Math.sin(x / 700 + z / 900);
+  const N = 256, S = 40000, geo = new THREE.PlaneGeometry(S, S, N, N); geo.rotateX(-Math.PI / 2);
+  const p = geo.attributes.position;
+  for (let i = 0; i < p.count; i++) p.setY(i, h(p.getX(i), p.getZ(i)));
+  geo.computeVertexNormals();
+  const ground = new THREE.Mesh(geo, new THREE.MeshStandardMaterial({ color: 0x8a8f85, roughness: 1, flatShading: true }));
+  scene.add(ground, new THREE.HemisphereLight(0xbfd8ff, 0x55504a, 1.2));
+  const sun = new THREE.DirectionalLight(0xffe2b8, 3); sun.position.set(-3, 1.2, 2); scene.add(sun);
+  scene.background = new THREE.Color(0x9cc3e6); scene.fog = new THREE.Fog(0x9cc3e6, 4000, 30000);
+  // the "real" ground is the triangle mesh; h() is its smooth twin (close enough for the bench)
+  return { terrainHeightAt: h, exposure: 1, update() {}, applyEnv() {}, credit: null };
+}
+let world;
+if (P.get('flat') === '1') world = flatWorld();
+else {
+  try {
+    const { buildJetWorld } = await import('./js/jetworld.js');
+    world = await buildJetWorld(scene, renderer, { seed: 7 });
+  } catch (e) {
+    console.warn('[flight] jetworld failed, using ?flat=1 ground:', e);
+    world = flatWorld();
+  }
+}
+renderer.toneMappingExposure = world.exposure ?? 1;
+if (world.credit) document.getElementById('credit').textContent = world.credit;
+const th = world.terrainHeightAt;
+const env = { terrainHeightAt: th, playArea: world.playArea ?? { cx: 0, cz: 0, half: 15000, ceiling: 6000 } };
+
+// ---------------------------------------------------------------- the jet
+const jet = buildJet(0, { screenLight: false });
+scene.add(jet.group);
+world.applyEnv?.(jet.group);
+if (!world.sunLight && P.get('flat') !== '1' && !scene.children.some((o) => o.isLight)) scene.add(new THREE.HemisphereLight(0xffffff, 0x444444, 2));
+
+// ---------------------------------------------------------------- spawn
+const AP = P.get('autopilot') === '1' ? 'turn' : P.get('autopilot');
+// the longest clear run from a point at height y: [heading, metres]
+function clearRun(x, y, z) {
+  let best = [0, 0];
+  for (let i = 0; i < 24; i++) {
+    const hd = i * 15 * D2R, sx = Math.sin(hd), sz = -Math.cos(hd);
+    let d = 0; while (d < 12000 && th(x + sx * d, z + sz * d) < y - 60) d += 100;
+    if (d > best[1]) best = [hd, d];
+  }
+  return best;
+}
+function findSpawn() {
+  if (world.spawn) return world.spawn;
+  let bx = 0, bz = 0, bh = 1e9;   // a valley: the lowest ground within 6 km of the centre
+  for (let x = -6000; x <= 6000; x += 250) for (let z = -6000; z <= 6000; z += 250) { const h = th(x, z); if (h < bh) { bh = h; bx = x; bz = z; } }
+  const y = bh + 450, [heading] = clearRun(bx, y, bz);
+  return { pos: [bx, y, bz], heading, speed: 220 };
+}
+const spawn = findSpawn();
+function spawnFor(mode) {
+  const sp = { pos: spawn.pos.slice(), heading: spawn.heading, speed: spawn.speed ?? 220 };
+  if (mode === 'stall') { sp.pos[1] += 1500; sp.speed = 160; }
+  if (mode === 'pullup') {   // level at the nearest rising ground 2-5 km away
+    const [x, , z] = sp.pos, y = th(x, z) + 250;
+    for (let i = 0; i < 72; i++) {
+      const hd = i * 5 * D2R, sx = Math.sin(hd), sz = -Math.cos(hd);
+      let d = 0; while (d < 6000 && th(x + sx * d, z + sz * d) < y + 30) d += 50;
+      if (d > 2000 && d < 5000) { sp.heading = hd; break; }
+    }
+    sp.pos[1] = y; sp.speed = 230;
+  }
+  if (mode === 'edge') {   // 1 km inside the east edge, heading out
+    const pa = env.playArea; sp.pos[0] = pa.cx + pa.half - 1000; sp.pos[2] = pa.cz; sp.heading = Math.PI / 2;
+    sp.pos[1] = Math.max(sp.pos[1], th(sp.pos[0], sp.pos[2]) + 1500);
+  }
+  return sp;
+}
+let s;
+const controls = createControls({ canvas });
+const ctl = controls.ctl;
+const cam = createChaseCam(camera); cam.setEnv(env);
+const hud = createHud(document.getElementById('hud')); hud.setEnv(env);
+let prev = { pos: [0, 0, 0], q: [0, 0, 0, 1] }, apT0 = 0, crashT = 0;
+function respawn() {
+  const sp = spawnFor(AP);
+  s = createJet(sp);
+  ctl.throttle = AP === 'stall' ? 0 : 0.8;
+  controls.reset(sp.heading, 0);
+  prev.pos = s.pos.slice(); prev.q = s.q.slice();
+  cam.snap(); apT0 = 0; crashT = 0;
+}
+respawn();
+controls.onLockChange = (l) => { msg.textContent = l ? '' : 'click to fly  |  mouse aim, W/S throttle, Shift afterburner, A/D roll, Q/E yaw, B brake, C look'; };
+controls.onLockChange(false);
+if (AP) msg.textContent = `autopilot: ${AP}`;
+
+// ---------------------------------------------------------------- autopilot (scripted ctl, written before each step)
+function autopilot(t) {
+  const h0 = spawn.heading;
+  const set = (hd, pt) => controls.reset(hd, pt);   // through the controls, so the camera sees the same aim
+  if (AP === 'turn') { const k = Math.floor(t / 6); set(h0 + (k % 2 ? -1 : 1) * (t > 1 ? 110 : 0) * D2R + k * 0.3, (k % 3 === 2 ? 15 : 3) * D2R); ctl.throttle = 0.95; }
+  else if (AP === 'stall') { set(h0, 75 * D2R); ctl.throttle = 0; }
+  else if (AP === 'pullup') { set(eulerOf(s.q).heading, 0); ctl.throttle = 0.85; }
+  else if (AP === 'edge') { set(Math.PI / 2, 0); ctl.throttle = 0.85; }   // aim held out of the box
+}
+
+// ---------------------------------------------------------------- the loop: fixed 120 Hz, interpolated rendering
+const FZ = P.get('freeze'), fzT = FZ && !isNaN(+FZ) ? +FZ : Infinity;
+let frozen = false, fzHold = 0;
+function freezeCheck() {
+  if (frozen || !FZ) return;
+  const hit = FZ === 'bank' ? Math.abs(eulerOf(s.q).bank) > 70 * D2R : FZ === 'stall' ? s.warn.stall : FZ === 'pullUp' ? s.warn.pullUp : false;
+  fzHold = hit ? fzHold + DT : 0;
+  if (s.t >= fzT || fzHold > (FZ === 'bank' ? 0.05 : 0.8)) { frozen = true; console.log('[flight] frozen at', s.t.toFixed(2), 's'); }
+}
+const pose = { pos: [0, 0, 0], q: [0, 0, 0, 1] }, qa = new THREE.Quaternion(), qb = new THREE.Quaternion(), ms = {}, mat = new Array(16);
+let acc = 0, last = performance.now(), simT = 0;
+function frame(now) {
+  const fdt = Math.min((now - last) / 1000, 0.1); last = now;
+  controls.update(fdt, s);
+  if (!frozen) acc += fdt;
+  while (acc >= DT) {
+    acc -= DT;
+    if (AP) { autopilot(apT0); apT0 += DT; }
+    for (let j = 0; j < 3; j++) prev.pos[j] = s.pos[j];
+    for (let j = 0; j < 4; j++) prev.q[j] = s.q[j];
+    stepJet(s, ctl, DT, env); simT += DT;
+    if (s.crashed && (crashT += DT) > 3 && !FZ) respawn();
+    freezeCheck(); if (frozen) { acc = 0; break; }
+  }
+  const a = frozen ? 1 : acc / DT;
+  for (let j = 0; j < 3; j++) pose.pos[j] = prev.pos[j] + (s.pos[j] - prev.pos[j]) * a;
+  qa.fromArray(prev.q); qb.fromArray(s.q); qa.slerp(qb, a); qa.toArray(pose.q);
+  jet.group.matrix.fromArray(poseMatrix(pose.pos, pose.q, mat)); jet.group.matrixWorldNeedsUpdate = true;
+  jet.group.visible = !s.crashed;
+  jet.setState(jetModelState(s, ms));
+  cam.update(fdt, pose, ctl.aim, s, controls.look);
+  world.update(simT, camera);
+  hud.update(camera, pose, ctl.aim, s);
+  renderer.render(scene, camera);
+  requestAnimationFrame(frame);
+}
+window.__bench = { get s() { return s; }, ctl, controls, env, world, camera };
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

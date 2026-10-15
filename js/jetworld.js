@@ -13,10 +13,11 @@
 //     gives a glare and never a white-out. Baked ONCE into a cube; calibrated so the zenith reads 0.075.
 //   * the sun: its colour is what that atmosphere lets through at 7 deg, pushed deeper amber for the owner's "sunset, golden light" ->
 //     (1, 0.53, 0.27); irradiance 7, so a grey (albedo 0.35) facing it reads 0.65 (luminance, linear) at the fight centre.
-//   * the mountains: the REAL ground from the climb's Copernicus GLO-30 heightmap (assets/climb/), decoded here at its full
-//     29 m in a 30 km window and at 58 m over the whole 120 km tile (continued past it, see contH), plus ridged relief below
-//     29 m (detailH, the same on the CPU), drawn by two GPU-displaced meshes: a graded square grid (22-34 m) under the fight,
-//     a polar mesh (1,536 around) to 260 km. The earth's curve is in. Sun shadows (also at the cloud sea's height) and valley
+//   * the mountains: the REAL ground from the Copernicus GLO-30 heightmap (assets/terrain/), decoded here at its full
+//     29 m in a 37.6 km window round the play area (GAME; the film's was 30 km round the anchor) and at 58 m over the whole
+//     120 km tile (continued past it, see contH), plus ridged relief below 29 m (detailH, the same on the CPU), drawn by two
+//     GPU-displaced meshes that follow the camera (GAME): a uniform 24 m square grid (+-6 km), a polar mesh (1,536 around) to
+//     260 km. The earth's curve is in. Sun shadows (also at the cloud sea's height) and valley
 //     sky occlusion are baked once by a GPU march toward the sun. Snow by height and slope, rock on the steep faces,
 //     glaciers with moraines in the flat valley floors.
 //   * a sea of cloud BELOW the fight (WORLD_FRAME.cloudDeck, y 200-650): a ray-marched volume (a 2-D field for where and how
@@ -29,7 +30,7 @@
 //
 // API (jetspec.js section 9, WORLD):
 //   buildJetWorld(scene, renderer, opts) -> Promise<world>         opts: { seed = 7, noAssets = false }
-//     world.update(t, sample?)    t in seconds (cloud drift); the plan sample is accepted and unused
+//     world.update(t, camera?)    t in seconds (cloud drift); GAME: the terrain meshes follow the camera (call it every frame)
 //     world.sunDir                Vector3, unit, toward the sun (world)
 //     world.sunColor, world.sunIntensity   the DirectionalLight values that match the terrain's lighting (MeshStandard units)
 //     world.sunLight              that DirectionalLight (in world.group, aimed at the fight centre, no shadow; GLUE may set one)
@@ -40,15 +41,21 @@
 //     world.fightBox              { min, max, centre, floorY } (world)
 //     world.terrainHeightAt(x,z)  world y of the ground (the same heights, relief and curve the GPU draws)
 //     world.sunVisibilityAt(x,y,z) 0..1, a point in a mountain's shadow or in sun (CPU twin of the bake): PLAN keeps jets at 1
-//     world.deck                  { base, top } world y of the cloud sea (cameras stay above its top: the march starts there)
+//     world.deck                  { base, top } world y of the cloud sea (GAME: a camera may be above, in or under it)
+//     world.deckTopAt(x, z, t)    GAME: the sea's top there (= base where it is clear), the CPU twin of the shader's field
+//     world.playArea, world.spawn GAME: { cx, cz, half, ceiling } and { pos, heading, speed } (README contract)
+//     world.setQuality(0..2)      GAME: 2 = the film's look (default); 1, 0 fewer cloud steps, a shorter terrain micro-normal
+//     world.hiZ                   GAME: the terrain shader's hidden-fragment early out (true; false for A/B only)
 //     world.cloudsAt(t)           [{ c: [x,y,z], half: [hx,hy,hz] }] each cumulus's box (centre, half sizes) at t: keep lenses out
 //     world.credit                the Copernicus line (show it on screen when the DEM is used), or null
 //     world.stats                 timings, triangles, clouds, terrainMaxInBox
 //     world.dispose()
 //   Renderer: { logarithmicDepthBuffer: true } (WORLD_FRAME.logDepth); every shader here carries three's logdepth chunks.
-//   Clouds and jets: a cloud box is drawn after the opaque jets with no knowledge of their depth, so a jet INSIDE a cloud's
-//   box but in front of its density would be painted over -- PLAN keeps jets out of cloudsAt() boxes (ponytail: pass a jet
-//   depth texture to the cloud shader if a shot ever needs a jet threading a cloud).
+//   Clouds and jets (GAME): each cloud march writes the depth of its light-weighted mean point, and the composites test the
+//   scene's depth against that, not the box face: a jet inside a cumulus box (or in the cloud sea) but in front of the
+//   cloud's mass stays on top; one behind it is covered. ponytail: one depth per pixel, so the cloud BETWEEN a jet and the
+//   lens is not drawn over the jet (a jet 25 m ahead in thick cloud shows crisp); a jet depth texture fixes that if needed.
+//   The cumulus never come near low flying: every base is >= 450 m over the highest ground under its box (+200 m).
 //
 // Copied (climbarena.js is NOT edited): the 16-bit PNG decoder (loadDem, lines 98-118), the haze model (GLSL_HAZE 193-210),
 // vnoise3/noised3 (GLSL_NOISE 152-180), the horizon-LUT bake (966-993). gradedAxis from kartworld.js. Imported: mulberry32
@@ -92,7 +99,20 @@ const FIGHT = { min: [FB.x[0], FB.y[0], FB.z[0]], max: [FB.x[1], FB.y[1], FB.z[1
 const DECK = { base: WORLD_FRAME.cloudDeck.base, thick: WORLD_FRAME.cloudDeck.top - WORLD_FRAME.cloudDeck.base };   // 4,700-5,150 m: the valleys fill, ridges stand through
 const WIND = [4.0, 1.5];                   // m/s, clouds drift ENE-ish (pure in t)
 
-const DEM_FILE = '../assets/climb/hunza_cop30_n36e074.png';
+const DEM_FILE = new URL('../assets/terrain/hunza_cop30_n36e074.png', import.meta.url).href;   // resolves from any page
+
+// GAME (Dogfight.io): the 30 x 30 km play area and the spawn. The tile ends 10.9 km east of the anchor and the continuation
+// (contH) starts 9.8 km east, so the square is shifted 5.5 km west (x -20.5 .. +9.5 km) to hold real 29 m data everywhere;
+// 3 km north to take in the big massif round the anchor. The full-resolution window (NEAR_PX) is centred on it.
+// The spawn: picked by a scan of the DEM (every 250 m, every 5 deg) for a valley run clear for 8 km at 250 m over its floor,
+// walls highest on both sides, the sun 25-75 deg off the nose; this one flies NW up a valley toward the centre with ~1.3 km
+// walls either side, the sun 58 deg to the left (lit faces ahead-right, cool shade left). Re-checked at build (spawnRun).
+const PLAY = Object.freeze({ cx: -5500, cz: -3000, half: 15000, ceiling: 6000 });
+const SPAWN = Object.freeze({ pos: Object.freeze([4250, 900, 4500]), heading: 310 * DEG, speed: 200 });
+const NEAR_PX = 1280;   // the full-resolution window: 1,280² px = 37.6 km, so the play area keeps full weight (nearW) to its edges
+// GAME: the inner rings' law, shared with the vertex shader's farSurfH (rings r0 * g^k up to 20 km; the near square's edge
+// is always inside that)
+const FAR_RING = Object.freeze({ r0: 5400, g: 1.006, S: 1536 });
 
 // r7: THE GROUND PAST THE MAP'S EAST EDGE. The v3 site is 372 pixels (10.9 km) from the tile's east edge, and the face shots
 // look ENE, so the old clamp (140 near columns repeating the edge column) and the far mirror (a straight N-S crease and the
@@ -150,9 +170,9 @@ async function loadHeights() {
         const i0 = mi(i, W), i1 = mi(i + 1, W), j0 = mi(j, H), j1 = mi(j + 1, H);
         return (hAt(i0, j0) * (1 - u) + hAt(i1, j0) * u) * (1 - v) + (hAt(i0, j1) * (1 - u) + hAt(i1, j1) * u) * v;
     };
-    // near: 1,024² at full resolution around the site (its east 140 columns are past the map: the continuation); far: the
-    // whole tile, 2x2 averaged (continued on the GPU, farH)
-    const NN = 1024, nx0 = SITE.px - NN / 2, ny0 = SITE.py - NN / 2, near = new Float32Array(NN * NN);
+    // near: NEAR_PX² at full resolution round the play area's centre (its east columns past the map: the continuation); far:
+    // the whole tile, 2x2 averaged (continued on the GPU, farH)
+    const NN = NEAR_PX, nx0 = SITE.px + Math.round(PLAY.cx / dx) - NN / 2, ny0 = SITE.py + Math.round(PLAY.cz / dz) - NN / 2, near = new Float32Array(NN * NN);
     for (let y = 0; y < NN; y++) for (let x = 0; x < NN; x++) {
         const px = nx0 + x, py = ny0 + y;
         near[y * NN + x] = px >= 0 && px < W && py >= 0 && py < H && (px - SITE.px) * dx <= cont.e0 - cont.a ? hAt(px, py) : contH(cont, (px - SITE.px) * dx, (py - SITE.py) * dz, hBil);
@@ -204,6 +224,7 @@ uniform vec3 uHazeLUT[32];
 uniform vec3 uBetaR, uBetaM;
 uniform float uTime; uniform vec2 uWind;
 uniform float uDeckY, uDeckT;
+uniform float uCloudQ;          // GAME: setQuality: the cloud marches' step count scale (1 = the film's)
 const float DATUM_ = ${DATUM.toFixed(1)};
 const float CURVE_ = ${CURVE.toExponential(6)};
 
@@ -228,24 +249,21 @@ float farH(vec2 p) {
     }
     return h;
 }
-float terrainH(vec2 p) {
-    float h = farH(p);
-    vec2 un = nearUV(p); float w = nearW(un);
-    if (w > 0.0) h = mix(h, textureLod(uHNear, un, 0.0).r, w);
-    return h + detailH(p) - dot(p, p) * CURVE_;
-}
-// r6: the DEM alone, no relief and no curve -- only the terrain shader's snow uses it, for the slope a snowfield sees
+// r6: the DEM alone, no relief and no curve -- the terrain shader's snow uses it, for the slope a snowfield sees.
+// GAME: the far DEM is read only where the near window fades out (mix(.., .., 1) is the near value: the same picture)
 float demH(vec2 p) {
-    float h = farH(p);
     vec2 un = nearUV(p); float w = nearW(un);
-    if (w > 0.0) h = mix(h, textureLod(uHNear, un, 0.0).r, w);
-    return h;
+    if (w >= 1.0) return textureLod(uHNear, un, 0.0).r;
+    float h = farH(p);
+    return w > 0.0 ? mix(h, textureLod(uHNear, un, 0.0).r, w) : h;
 }
+float terrainH(vec2 p) { return demH(p) + detailH(p) - dot(p, p) * CURVE_; }
 // x: sun visibility on the ground (soft), y: sky visibility (valley occlusion), z: sun visibility at the cloud sea's height
 vec3 shadowAt(vec2 p) {
+    vec2 un = nearUV(p); float w = nearW(un);
+    if (w >= 1.0) return textureLod(uShNear, un, 0.0).rgb;
     vec2 uf = ((p - uShFarR.xy) * uShFarR.zw + 0.5) / uShFarN, ef = min(uf, 1.0 - uf);
     vec3 s = ef.x < 0.0 || ef.y < 0.0 ? vec3(1.0) : textureLod(uShFar, uf, 0.0).rgb;
-    vec2 un = nearUV(p); float w = nearW(un);
     if (w > 0.0) s = mix(s, textureLod(uShNear, un, 0.0).rgb, w);
     return s;
 }
@@ -308,16 +326,59 @@ float deckTop(vec2 xz, float oct) {
 `;
 const LOGV = '#include <common>\n#include <logdepthbuf_pars_vertex>\n';
 const LOGF = '#include <common>\n#include <logdepthbuf_pars_fragment>\n';
+// GAME: the depth buffer value of a world point (the same as three's log depth writes for it), so a cloud march can write
+// the depth of its light-weighted mean point instead of its box face (after LOGF)
+const GLSL_DEPTH = /* glsl */`
+#if !defined( USE_LOGARITHMIC_DEPTH_BUFFER )
+uniform mat4 projectionMatrix;
+#endif
+float depthOf(vec3 wp) {
+    vec4 vp = viewMatrix * vec4(wp, 1.0);
+#if defined( USE_LOGARITHMIC_DEPTH_BUFFER )
+    return log2(1.0 + max(-vp.z, 0.0)) * logDepthBufFC * 0.5;
+#else
+    vec4 cp = projectionMatrix * vp; return clamp(0.5 * cp.z / max(cp.w, 1e-6) + 0.5, 0.0, 1.0);
+#endif
+}
+`;
 
 // --- terrain
 const TERRAIN_VS = /* glsl */`
 ${LOGV}${GLSL_COMMON}
 uniform float uDiscard;   // the far mesh skips the square the near mesh covers
+uniform vec2 uFarC;       // GAME: the far ring's centre (it follows the camera in 1 km steps)
 varying vec3 vW;
+// GAME: the height the FAR ring draws at p (its polar quad round p, split as farChunks splits it, linear in the triangle).
+// The near square's outer edge sits on it, so the two meshes meet with no crack: the far ring's 22-50 m cells cut the
+// relief's crests up to ~10 m lower or higher than the near grid does, and where the far ground stood higher than the near
+// edge a grazing ray slipped under it to the sky (a dotted line of sky across the valleys 6 km out).
+float farSurfH(vec2 p) {
+    const float R0 = ${FAR_RING.r0.toFixed(1)}, G = ${FAR_RING.g.toFixed(4)}, DA = 6.28318531 / ${FAR_RING.S.toFixed(1)};
+    vec2 q = p - uFarC;
+    float k = floor(log(max(length(q), R0) / R0) / log(G)), s = floor(mod(atan(q.y, q.x), 6.28318531) / DA);
+    float r0 = R0 * pow(G, k), r1 = r0 * G;
+    vec2 e0 = vec2(cos(s * DA), sin(s * DA)), e1 = vec2(cos((s + 1.0) * DA), sin((s + 1.0) * DA));
+    vec2 A = e0 * r0, B = e1 * r0, C = e0 * r1, D = e1 * r1;
+    // triangles (A, B, C) and (B, D, C): which side of the diagonal B-C is q on
+    vec2 P1 = A, P2 = B, P3 = C;
+    float side = (C.x - B.x) * (q.y - B.y) - (C.y - B.y) * (q.x - B.x), sideA = (C.x - B.x) * (A.y - B.y) - (C.y - B.y) * (A.x - B.x);
+    if (side * sideA < 0.0) P1 = D;
+    float den = (P2.y - P3.y) * (P1.x - P3.x) + (P3.x - P2.x) * (P1.y - P3.y);
+    float l1 = ((P2.y - P3.y) * (q.x - P3.x) + (P3.x - P2.x) * (q.y - P3.y)) / den;
+    float l2 = ((P3.y - P1.y) * (q.x - P3.x) + (P1.x - P3.x) * (q.y - P3.y)) / den;
+    return l1 * terrainH(P1 + uFarC) + l2 * terrainH(P2 + uFarC) + (1.0 - l1 - l2) * terrainH(P3 + uFarC);
+}
 void main() {
     vec4 w = modelMatrix * vec4(position, 1.0);
-    float sk = position.y;           // the near mesh's skirt: y < 0 marks a skirt vertex (hangs 250 m)
-    w.y = terrainH(w.xz) + min(sk, 0.0) * 250.0;
+    float sk = position.y;           // the near mesh's skirt: y < 0 marks a skirt vertex (hangs 250 m); GAME: y > 0 its outer edge
+    float h;
+    if (sk != 0.0) {
+        // the edge's straight 24 m segments must not dip under the far ground's own kinks between them: the highest of five
+        // samples of it along the edge over this vertex's span, + 4 m (a lip under a pixel at 6 km)
+        vec2 t = abs(position.x) > abs(position.z) ? vec2(0.0, ${(24 / 4).toFixed(1)}) : vec2(${(24 / 4).toFixed(1)}, 0.0);
+        h = max(max(farSurfH(w.xz), max(farSurfH(w.xz + t), farSurfH(w.xz - t))), max(farSurfH(w.xz + 2.0 * t), farSurfH(w.xz - 2.0 * t))) + 4.0;
+    } else h = terrainH(w.xz);
+    w.y = h + min(sk, 0.0) * 250.0;
     vW = w.xyz;
     gl_Position = projectionMatrix * viewMatrix * w;
     #include <logdepthbuf_vertex>
@@ -325,10 +386,28 @@ void main() {
 const TERRAIN_FS = /* glsl */`
 ${LOGF}${GLSL_COMMON}
 uniform float uDiscard;
+uniform vec2 uNearC;                                  // GAME: the near square's centre (it follows the camera)
+uniform sampler2D uZ; uniform float uZOn; uniform vec2 uZScale;   // GAME: this frame's half-size terrain depth (see cloudPass)
+uniform float uTerrQ;                                 // GAME: setQuality: the micro-normal's reach (1 = the film's)
 varying vec3 vW;
 void main() {
-    if (uDiscard > 0.0 && max(abs(vW.x), abs(vW.z)) < uDiscard) discard;
+    if (uDiscard > 0.0 && max(abs(vW.x - uNearC.x), abs(vW.z - uNearC.y)) < uDiscard) discard;
     #include <logdepthbuf_fragment>
+    // GAME: hidden ground leaves here. The log depth writes gl_FragDepth, so the GPU's early depth test (Apple's hidden
+    // surface removal) is off and every hidden layer of a range ran this whole shader. uZ is this frame's terrain depth,
+    // MAX-reduced to quarter size over a 6x6 half-size block (ZMAX_FS); a fragment behind the farthest of the 2x2 texels
+    // round it lies behind ground drawn everywhere within ~6 px of it. (A plain 2x2 half-size test lost pixels through the
+    // 1-2 px notches of every grazing glacier floor: sky-coloured sparkles.)
+    if (uZOn > 0.5) {
+#if defined( USE_LOGARITHMIC_DEPTH_BUFFER )
+        float fz = log2(vFragDepth) * logDepthBufFC * 0.5;
+#else
+        float fz = gl_FragCoord.z;
+#endif
+        ivec2 zn = textureSize(uZ, 0), i0 = clamp(ivec2(floor(gl_FragCoord.xy * uZScale - 0.5)), ivec2(0), max(zn - 2, ivec2(0)));
+        float zm = max(max(texelFetch(uZ, i0, 0).r, texelFetch(uZ, i0 + ivec2(1, 0), 0).r), max(texelFetch(uZ, i0 + ivec2(0, 1), 0).r, texelFetch(uZ, i0 + ivec2(1, 1), 0).r));
+        if (fz > zm + 2e-4) discard;
+    }
     vec3 cam = cameraPosition;
     float dist = length(vW - cam);
     float e = max(14.0, dist * 0.0022);
@@ -342,12 +421,14 @@ void main() {
     // a distance fade left it a smooth relief map. An octave of wavelength L is kept while it spans more than ~3 pixels.
     float px = max(length(dFdx(vW)), length(dFdy(vW)));
     #define KEEP(L) (1.0 - smoothstep((L) / 6.0, (L) / 2.5, px))
-    float n1 = tn(p / 260.0), n2 = mix(0.5, tn(p / 47.0 + 9.0), KEEP(47.0)), n3 = mix(0.5, tn(p / 9.0 + 4.0), KEEP(9.0));
-    float n4 = mix(0.5, tn(p / 2.7 + 13.0), KEEP(2.7));   // grit
+    // GAME: an octave whose weight is 0 here is not fetched (KEPT): the same picture, fewer texture reads far off
+    #define KEPT(L, X) (KEEP(L) > 0.0 ? mix(0.5, X, KEEP(L)) : 0.5)
+    float n1 = tn(p / 260.0), n2 = KEPT(47.0, tn(p / 47.0 + 9.0)), n3 = KEPT(9.0, tn(p / 9.0 + 4.0));
+    float n4 = KEPT(2.7, tn(p / 2.7 + 13.0));   // grit
     // r7: the normal detail fades by the pixel's footprint too (it faded by distance, 2.5-14 km): the same as before through a
     // 55 deg lens (1.9 m a pixel at 2.5 km, 10.5 m at 14 km), but DIRECT's 2.5-12 deg ridge lenses look 8-12 km off at 0.3-1 m a
     // pixel, and there the faces had gone to smooth clay
-    float fd = 1.0 - smoothstep(1.9, 10.5, px), fn = KEEP(11.0);
+    float fd = 1.0 - smoothstep(1.9 * uTerrQ, 10.5 * uTerrQ, px), fn = KEEP(11.0);
     // the slope a snowfield sees: the DEM over +-45 m. The 29 m bumps and the relief broke every snowfield into camouflage blobs.
     float eL = max(45.0, e * 2.0);
     float dxm = demH(p - vec2(eL, 0.0)), dxp = demH(p + vec2(eL, 0.0)), dzm = demH(p - vec2(0.0, eL)), dzp = demH(p + vec2(0.0, eL));
@@ -361,7 +442,7 @@ void main() {
     // Drawn biplanar -- streaks in (x, height) on faces looking north or south, (z, height) on faces looking east or west -- so
     // they stay straight; projected along the local gradient instead they curled into whorls on every rounded crest.
     float wx = N0.x * N0.x / max(N0.x * N0.x + N0.z * N0.z, 1e-4);
-    float fl1 = mix(0.5, mix(tn(vec2(p.x / 11.0, vW.y / 90.0) + 21.0), tn(vec2(p.y / 11.0, vW.y / 90.0) + 23.0), wx), fn);   // fades before it sparkles
+    float fl1 = fn > 0.0 ? mix(0.5, mix(tn(vec2(p.x / 11.0, vW.y / 90.0) + 21.0), tn(vec2(p.y / 11.0, vW.y / 90.0) + 23.0), wx), fn) : 0.5;   // fades before it sparkles
     float fl2 = mix(tn(vec2(p.x / 34.0, vW.y / 300.0) + 57.0), tn(vec2(p.y / 34.0, vW.y / 300.0) + 59.0), wx);
     float flute = fl1 * 0.45 + fl2 * 0.55;
     vec2 gd = normalize(vec2(hx, hz) + 1e-4), across = vec2(-gd.y, gd.x);   // (the glaciers' moraines still run with the flow)
@@ -370,11 +451,14 @@ void main() {
     float flutes = smoothstep(0.56, 0.7, flute) * (1.0 - smoothstep(0.3, 0.46, slopeS)) * rockM;   // snow left in the flutes
     vec3 N = N0;
     if (fd > 0.0) {
-        vec4 r1 = noised3(vW / 28.0 + 1.7), r2 = noised3(vW / 7.0 + 3.1), r3 = noised3(vW / 2.2 + 5.3), s1 = noised3(vW / 60.0), s2 = noised3(vW / 14.0 + 8.1);
+        // GAME: the octaves whose weight is 0 at this footprint are not evaluated (each noised3 is 8 hashes)
+        vec4 r1 = noised3(vW / 28.0 + 1.7), s1 = noised3(vW / 60.0);
+        vec4 r2 = KEEP(7.0) > 0.0 ? noised3(vW / 7.0 + 3.1) : vec4(0.0), r3 = KEEP(2.2) > 0.0 ? noised3(vW / 2.2 + 5.3) : vec4(0.0);
+        vec4 s2 = KEEP(14.0) > 0.0 ? noised3(vW / 14.0 + 8.1) : vec4(0.0);
         // ribs across the fall line (the flutes' own relief) plus the rock's grain; snow keeps a soft wind-sculpted swell
-        float ribZ = (tn(vec2(p.x / 11.0 + 0.35, vW.y / 90.0) + 21.0) - tn(vec2(p.x / 11.0 - 0.35, vW.y / 90.0) + 21.0)) * 1.4 * fn
+        float ribZ = (fn > 0.0 ? (tn(vec2(p.x / 11.0 + 0.35, vW.y / 90.0) + 21.0) - tn(vec2(p.x / 11.0 - 0.35, vW.y / 90.0) + 21.0)) * 1.4 * fn : 0.0)
                    + (tn(vec2(p.x / 34.0 + 0.35, vW.y / 300.0) + 57.0) - tn(vec2(p.x / 34.0 - 0.35, vW.y / 300.0) + 57.0)) * 0.9;
-        float ribX = (tn(vec2(p.y / 11.0 + 0.35, vW.y / 90.0) + 23.0) - tn(vec2(p.y / 11.0 - 0.35, vW.y / 90.0) + 23.0)) * 1.4 * fn
+        float ribX = (fn > 0.0 ? (tn(vec2(p.y / 11.0 + 0.35, vW.y / 90.0) + 23.0) - tn(vec2(p.y / 11.0 - 0.35, vW.y / 90.0) + 23.0)) * 1.4 * fn : 0.0)
                    + (tn(vec2(p.y / 34.0 + 0.35, vW.y / 300.0) + 59.0) - tn(vec2(p.y / 34.0 - 0.35, vW.y / 300.0) + 59.0)) * 0.9;
         vec3 ribG = vec3(ribZ * (1.0 - wx), 0.0, ribX * wx) * smoothstep(0.08, 0.2, slope);
         vec3 g = (r1.yzw * 0.6 * KEEP(28.0) + r2.yzw * 0.45 * KEEP(7.0) + r3.yzw * 0.35 * KEEP(2.2)) * rockM
@@ -542,7 +626,7 @@ void main() { vec4 w = modelMatrix * vec4(position, 1.0); vW = w.xyz; gl_Positio
 }`;
 const DECK_FS = /* glsl */`
 precision highp sampler3D;
-${LOGF}${GLSL_COMMON}
+${LOGF}${GLSL_DEPTH}${GLSL_COMMON}
 uniform sampler3D uN3;
 varying vec3 vW;
 // the cloud sea's density: the 2D field sets where it is and how high its top rises, the 3D noise erodes it into billows
@@ -561,17 +645,24 @@ float deckD(vec3 p, float oct, bool fine) {
 }
 void main() {
     #include <logdepthbuf_fragment>
+    // GAME: the slab is a box now (seen from above, from inside it or from under it): the march starts where the ray enters
+    // the slab (at the lens inside it), not only at the top plane, so flying in or under the cloud sea keeps it
     vec3 ro = cameraPosition, rd = normalize(vW - ro);
-    if (rd.y > -1e-4) discard;
-    float d0 = length(vW - ro);
+    float ry = abs(rd.y) < 1e-5 ? 1e-5 : rd.y, tb = (uDeckY - ro.y) / ry, tt = (uDeckY + uDeckT - ro.y) / ry;
+    float tin = max(min(tb, tt), 0.0), tout = max(tb, tt);
+    if (tout <= tin) discard;
+    vec3 st = ro + rd * tin;
+    float d0 = tin;
     float oct = d0 < 12000.0 ? 5.0 : mix(5.0, 3.0, clamp((d0 - 12000.0) / 40000.0, 0.0, 1.0));
-    float L = min((uDeckT + 2.0) / -rd.y, 4500.0);   // a grazing ray stops at 4.5 km in the slab: past that the haze has it
-    float dt = max(L / 64.0, 8.0), jit = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));
+    float L = min(tout - tin + 2.0, 4500.0);   // a grazing ray stops at 4.5 km in the slab: past that the haze has it
+    // GAME: fewer steps far off (the slab there is a few half-size pixels tall and hazed), times the quality knob
+    float ns = mix(64.0, 32.0, smoothstep(10000.0, 40000.0, d0)) * uCloudQ;
+    float dt = max(L / ns, 8.0), jit = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));
     float t = dt * jit, T = 1.0, tw = 0.0, wsum = 0.0, c = dot(rd, uSunDir);
     vec3 Lc = vec3(0.0);
     for (int i = 0; i < 80; i++) {
         if (t > L || T < 0.02) break;
-        vec3 p = vW + rd * t;
+        vec3 p = st + rd * t;
         if (p.y < terrainH(p.xz)) break;   // the ground: what is in front of it stays, it shows through behind
         float d = deckD(p, oct, d0 + t < 25000.0);
         if (d > 0.002) {
@@ -589,7 +680,9 @@ void main() {
     }
     float alpha = 1.0 - T;
     if (alpha < 0.004) discard;
-    vec3 col = applyHaze(Lc / alpha, vW + rd * (tw / max(wsum, 1e-4)), ro);
+    vec3 hp = st + rd * (tw / max(wsum, 1e-4));
+    gl_FragDepth = depthOf(hp);   // GAME: the composite tests jets against the cloud's mean depth, not the slab's face
+    vec3 col = applyHaze(Lc / alpha, hp, ro);
     gl_FragColor = vec4(col, alpha);
     #include <tonemapping_fragment>
     #include <colorspace_fragment>
@@ -606,7 +699,7 @@ void main() { vec4 w = modelMatrix * vec4(position, 1.0); vW = w.xyz; vOrg = (mo
 }`;
 const CUM_FS = /* glsl */`
 precision highp sampler3D;
-${LOGF}${GLSL_COMMON}
+${LOGF}${GLSL_DEPTH}${GLSL_COMMON}
 uniform sampler3D uN3;
 uniform vec4 uBlobs[10];
 uniform vec3 uHalf, uOff;
@@ -650,7 +743,8 @@ void main() {
     vec2 th = boxHit(ro, rd, uHalf);
     th.x = max(th.x, 0.0);
     if (th.x >= th.y) discard;
-    float len = th.y - th.x, dt = max(len / 90.0, 7.0);   // r6: the cells are wide and thin -- 56 steps left a grain on their edges
+    // r6: the cells are wide and thin -- 56 steps left a grain on their edges. GAME: 90 near, 48 past ~30 km, x quality
+    float len = th.y - th.x, dt = max(len / (mix(90.0, 48.0, smoothstep(8000.0, 30000.0, th.x)) * uCloudQ), 7.0);
     float jit = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));
     float t = th.x + dt * jit, T = 1.0, tw = 0.0, wsum = 0.0;
     vec3 L = vec3(0.0);
@@ -661,7 +755,7 @@ void main() {
         float d = densAt(p, true);
         if (d > 0.002) {
             float od = 0.0, s = 16.0; vec3 lp = p;
-            for (int k = 0; k < 5; k++) { lp += uSunDir * s; od += densAt(lp, k < 2) * s; s *= 1.9; }
+            for (int k = 0; k < 5; k++) { if (uCloudQ < 0.6 && k > 2) break; lp += uSunDir * s; od += densAt(lp, k < 2) * s; s *= 1.9; }   // GAME: 3 light steps at quality 0
             vec3 S = vec3(0.0); float a = 1.0, b = 1.0, g = 1.0;
             for (int o = 0; o < 3; o++) { S += vec3(a * exp(-uSig * od * b) * (mix(hg(c, 0.72 * g), hg(c, -0.2 * g), 0.3) + 0.06)); a *= 0.45; b *= 0.35; g *= 0.3; }
             float hf = clamp((p.y - uBaseY) / (uHalf.y * 2.0 - 30.0), 0.0, 1.0);
@@ -677,6 +771,7 @@ void main() {
     if (alpha < 0.004) discard;
     vec3 col = L / alpha;
     vec3 hp = cameraPosition + rd * (tw / max(wsum, 1e-4));
+    gl_FragDepth = depthOf(hp);   // GAME: the cloud's light-weighted mean depth (a jet in front of it inside the box stays on top)
     col = applyHaze(col, hp, cameraPosition);
     gl_FragColor = vec4(col, alpha);
     #include <tonemapping_fragment>
@@ -699,13 +794,23 @@ ${LOGV}
 void main() { gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
     #include <logdepthbuf_vertex>
 }`;
+// GAME: full screen (the camera may be in or under the slab); bilinear colour by hand and the depth the march wrote,
+// weighted by each texel's opacity, so a jet in front of the cloud's mass stays on top
 const DECKC_FS = /* glsl */`
-${LOGF}
-uniform sampler2D uTex; uniform vec2 uFull;
+#include <common>
+uniform sampler2D uTex, uDep; uniform vec2 uFull; uniform ivec2 uHalfN;
 void main() {
-    #include <logdepthbuf_fragment>
-    vec4 c = texture(uTex, gl_FragCoord.xy / uFull);
+    vec2 h = gl_FragCoord.xy * vec2(uHalfN) / uFull - 0.5, f = fract(h);
+    ivec2 i0 = ivec2(floor(h));
+    vec4 c = vec4(0.0); float zs = 0.0, za = 0.0;
+    for (int k = 0; k < 4; k++) {
+        ivec2 o = ivec2(k & 1, k >> 1), q = clamp(i0 + o, ivec2(0), uHalfN - 1);
+        float wb = (o.x == 1 ? f.x : 1.0 - f.x) * (o.y == 1 ? f.y : 1.0 - f.y);
+        vec4 tc = texelFetch(uTex, q, 0);
+        c += tc * wb; zs += wb * tc.a * texelFetch(uDep, q, 0).r; za += wb * tc.a;
+    }
     if (c.a < 0.004) discard;
+    gl_FragDepth = zs / max(za, 1e-6);
     gl_FragColor = vec4(c.rgb / c.a, c.a);
     #include <tonemapping_fragment>
     #include <colorspace_fragment>
@@ -740,52 +845,77 @@ void main() {
 #else
     vec4 cp = projectionMatrix * viewMatrix * vec4(cameraPosition + rd * tn, 1.0); z = clamp(0.5 * cp.z / max(cp.w, 1e-6) + 0.5, 0.0, 1.0);
 #endif
-    gl_FragDepth = z;
     vec2 h = gl_FragCoord.xy * vec2(uHalfN) / uFull - 0.5, f = fract(h);
     ivec2 i0 = ivec2(floor(h));
-    vec4 acc = vec4(0.0); float ws = 0.0;
+    vec4 acc = vec4(0.0); float ws = 0.0, zs = 0.0, za = 0.0;
     for (int k = 0; k < 4; k++) {
         ivec2 o = ivec2(k & 1, k >> 1), q = clamp(i0 + o, ivec2(0), uHalfN - 1);
         float wb = (o.x == 1 ? f.x : 1.0 - f.x) * (o.y == 1 ? f.y : 1.0 - f.y);
-        float ok = texelFetch(uDep, q, 0).r >= z - 2e-5 ? 1.0 : 0.0;   // the terrain at that texel stood behind the face
-        acc += texelFetch(uTex, q, 0) * wb * ok; ws += wb * ok;
+        // GAME: the half-size depth is the terrain's, or (nearer) the cloud's mean depth where a march drew: both lie behind
+        // the face unless terrain stood in front of it
+        float dz = texelFetch(uDep, q, 0).r, ok = dz >= z - 2e-5 ? 1.0 : 0.0;
+        vec4 tc = texelFetch(uTex, q, 0);
+        acc += tc * wb * ok; ws += wb * ok; zs += wb * ok * tc.a * dz; za += wb * ok * tc.a;
     }
     if (ws < 1e-4) discard;
     vec4 c = acc / ws;
     if (c.a < 0.004) discard;
+    gl_FragDepth = zs / max(za, 1e-6);   // GAME: the depth of the cloud's mass, not of its box: a jet inside the box but in front of the cloud stays on top
     gl_FragColor = vec4(c.rgb / c.a, c.a);
     #include <tonemapping_fragment>
     #include <colorspace_fragment>
 }`;
+// GAME: the terrain depth's conservative max at quarter size (for the terrain shader's early out): each texel holds the
+// farthest of the 6x6 half-size texels round its own 4x4 pixels
+const ZMAX_FS = /* glsl */`
+uniform sampler2D uDep;
+void main() {
+    ivec2 q = ivec2(gl_FragCoord.xy) * 2, n = textureSize(uDep, 0) - 1;
+    float m = 0.0;
+    for (int j = -2; j < 4; j++) for (int i = -2; i < 4; i++) m = max(m, texelFetch(uDep, clamp(q + ivec2(i, j), ivec2(0), n), 0).r);
+    gl_FragColor = vec4(m, 0.0, 0.0, 1.0);
+}`;
 // the terrain's depth alone, for the cumulus' half-size pass (the far chunks still skip the near square)
 const TDEPTH_FS = /* glsl */`
 ${LOGF}
-uniform float uDiscard;
+uniform float uDiscard; uniform vec2 uNearC;
 varying vec3 vW;
 void main() {
-    if (uDiscard > 0.0 && max(abs(vW.x), abs(vW.z)) < uDiscard) discard;
+    if (uDiscard > 0.0 && max(abs(vW.x - uNearC.x), abs(vW.z - uNearC.y)) < uDiscard) discard;
     #include <logdepthbuf_fragment>
     gl_FragColor = vec4(0.0);
 }`;
 
 // ================================================================== geometry
-function gradedAxis(d0, g, R) {   // (kartworld.js gradedAxis)
+function gradedAxis(d0, g, R) {   // (kartworld.js gradedAxis; GAME: unused since the near grid went uniform, kept)
     const pos = [0];
     for (let x = 0; x < R;) { x = Math.min(R, x + d0 + g * x); pos.push(x); }
     return [...pos.slice(1).map((x) => -x).reverse(), ...pos];
 }
-// the square under the fight: graded grid + a skirt one ring wide (y = −1 on the skirt)
-function nearGeometry(R) {
-    const ax = gradedAxis(22, 0.002, R), n = ax.length, m = n + 2;
-    const pos = new Float32Array(m * m * 3), idx = [];
+// GAME: the square round the CAMERA (it follows it, see world.update): a UNIFORM grid (d m) + a skirt one ring wide (y = −1 on
+// the skirt), cut into tiles x tiles chunks that share one vertex buffer, each with a bounding volume (y: the DEM's range) so
+// the frustum drops the ones behind the lens. Uniform (the film's was graded 22-34 m) so that moving it by a multiple of d
+// puts every vertex back on a vertex of the same world lattice: the ground never swims or pops as the square follows.
+function nearChunks(R, d, tiles, yLo, yHi) {
+    const n = Math.round((2 * R) / d) + 1, m = n + 2;
+    const pos = new Float32Array(m * m * 3);
     for (let j = 0; j < m; j++) for (let i = 0; i < m; i++) {
         const ii = clamp(i - 1, 0, n - 1), jj = clamp(j - 1, 0, n - 1), sk = i === 0 || j === 0 || i === m - 1 || j === m - 1;
-        const k = (j * m + i) * 3; pos[k] = ax[ii]; pos[k + 1] = sk ? -1 : 0; pos[k + 2] = ax[jj];
+        const k = (j * m + i) * 3; pos[k] = -R + ii * d; pos[k + 1] = sk ? -1 : ii === 0 || jj === 0 || ii === n - 1 || jj === n - 1 ? 1 : 0; pos[k + 2] = -R + jj * d;
     }
-    for (let j = 0; j < m - 1; j++) for (let i = 0; i < m - 1; i++) { const a = j * m + i, b = a + 1, c = a + m, d = c + 1; idx.push(a, c, b, b, c, d); }
-    const g = new THREE.BufferGeometry();
-    g.setAttribute('position', new THREE.BufferAttribute(pos, 3)); g.setIndex(idx);
-    return g;
+    const attr = new THREE.BufferAttribute(pos, 3), cells = m - 1, out = [];
+    for (let tj = 0; tj < tiles; tj++) for (let ti = 0; ti < tiles; ti++) {
+        const i0 = Math.floor((ti * cells) / tiles), i1 = Math.floor(((ti + 1) * cells) / tiles), j0 = Math.floor((tj * cells) / tiles), j1 = Math.floor(((tj + 1) * cells) / tiles);
+        const idx = new Uint32Array((i1 - i0) * (j1 - j0) * 6);
+        let q = 0;
+        for (let j = j0; j < j1; j++) for (let i = i0; i < i1; i++) { const a = j * m + i, b = a + 1, c = a + m, e = c + 1; idx[q++] = a; idx[q++] = c; idx[q++] = b; idx[q++] = b; idx[q++] = c; idx[q++] = e; }
+        const g = new THREE.BufferGeometry();
+        g.setAttribute('position', attr); g.setIndex(new THREE.BufferAttribute(idx, 1));
+        g.boundingBox = new THREE.Box3(new THREE.Vector3(pos[(j0 * m + i0) * 3], yLo - 250, pos[(j0 * m + i0) * 3 + 2]), new THREE.Vector3(pos[(j1 * m + i1) * 3], yHi, pos[(j1 * m + i1) * 3 + 2]));
+        g.boundingSphere = g.boundingBox.getBoundingSphere(new THREE.Sphere());
+        out.push(g);
+    }
+    return out;
 }
 // the rest of the world: rings from r0 to r1, 1,536 around, the ring step growing from 0.6% to 2%.
 // r8: cut into chunks (24 sectors x 4 bands) that share ONE vertex buffer, each with a bounding sphere that holds its displaced
@@ -796,7 +926,7 @@ function nearGeometry(R) {
 // yLo/yHi: the world y range the vertex shader can reach before the curve (the DEM's range plus the relief).
 function farChunks(r0, r1, S, yLo, yHi, sectors = 24, bands = [12000, 30000, 80000]) {
     const rs = [];
-    for (let r = r0; r < r1;) { rs.push(r); r *= 1 + (r < 20000 ? 0.006 : r < 60000 ? 0.012 : 0.022); }
+    for (let r = r0; r < r1;) { rs.push(r); r *= 1 + (r < 20000 ? FAR_RING.g - 1 : r < 60000 ? 0.012 : 0.022); }
     rs.push(r1);
     const pos = new Float32Array(rs.length * S * 3);
     let k = 0;
@@ -889,12 +1019,12 @@ export async function buildJetWorld(scene, renderer, { seed = 7, noAssets = fals
     // the noise texture (seeded) the GPU's tn() reads, and its CPU twin
     const rnd = mulberry32(seed * 7919 + 13), nz = new Uint8Array(256 * 256 * 4);
     for (let i = 0; i < nz.length; i++) nz[i] = Math.floor(rnd() * 256);
-    const tnC = (x, y) => {   // = GLSL tn(): smoothstep weights, LinearFilter on texels i-1, i
+    const tnC = (x, y) => {   // = GLSL tn(): smoothstep weights, LinearFilter on texels i-1, i (no closure per call: hot path)
         x += 0.5; y += 0.5;
         const i = Math.floor(x) - 1, j = Math.floor(y) - 1;
         let fx = x - i - 1, fy = y - j - 1; fx = fx * fx * (3 - 2 * fx); fy = fy * fy * (3 - 2 * fy);
-        const a = (ii, jj) => nz[((jj & 255) * 256 + (ii & 255)) * 4];
-        return ((a(i, j) * (1 - fx) + a(i + 1, j) * fx) * (1 - fy) + (a(i, j + 1) * (1 - fx) + a(i + 1, j + 1) * fx) * fy) / 255;
+        const r0 = (j & 255) * 256, r1 = ((j + 1) & 255) * 256, c0 = i & 255, c1 = (i + 1) & 255;
+        return ((nz[(r0 + c0) * 4] * (1 - fx) + nz[(r0 + c1) * 4] * fx) * (1 - fy) + (nz[(r1 + c0) * 4] * (1 - fx) + nz[(r1 + c1) * 4] * fx) * fy) / 255;
     };
     const detailAt = (x, z) => {   // = GLSL detailH()
         let r1 = 1 - Math.abs(tnC(x / 170, z / 170) * 2 - 1); r1 = r1 * r1 * r1;
@@ -902,14 +1032,16 @@ export async function buildJetWorld(scene, renderer, { seed = 7, noAssets = fals
         let g3 = 1 - Math.abs(tnC(x / 95 + 77, z / 95 + 77) * 2 - 1); g3 = g3 * g3 * g3;
         return 46 * (r1 - 0.3) + 14 * (r2 - 0.3) * (0.5 + r1) - 16 * (g3 - 0.3) + 2 * (tnC(x / 23 + 90, z / 23 + 90) - 0.5);
     };
+    // the crash test (called many times per step): no allocation; the far DEM is only read where the near window fades out
+    const NR = H.near;
     const terrainHeightAt = (x, z) => {
-        let h = farS(x, z) + detailAt(x, z);
-        if (nearS) {
-            const ux = ((x - H.near.x0) / H.near.dx + 0.5) / H.near.n, uz = ((z - H.near.z0) / H.near.dz + 0.5) / H.near.n;
+        let h;
+        if (NR) {
+            const ux = ((x - NR.x0) / NR.dx + 0.5) / NR.n, uz = ((z - NR.z0) / NR.dz + 0.5) / NR.n;
             const w = smooth(0, 0.06, Math.min(ux, 1 - ux, uz, 1 - uz));
-            if (w > 0) h += (nearS(x, z) - h) * w;
-        }
-        return h - (x * x + z * z) * CURVE;
+            h = w >= 1 ? nearS(x, z) : w > 0 ? farS(x, z) * (1 - w) + nearS(x, z) * w : farS(x, z);
+        } else h = farS(x, z);
+        return h + detailAt(x, z) - (x * x + z * z) * CURVE;
     };
     lap('dem');
 
@@ -933,6 +1065,9 @@ export async function buildJetWorld(scene, renderer, { seed = 7, noAssets = fals
         uBetaR: { value: V(5.8e-6, 13.5e-6, 33.1e-6) }, uBetaM: { value: V(3.8e-5, 3.8e-5, 3.8e-5) },
         uTime: { value: 0 }, uWind: { value: new THREE.Vector2(...WIND) },
         uDeckY: { value: DECK.base }, uDeckT: { value: DECK.thick },
+        // GAME: the camera-following terrain, the half-size depth early out, the quality knobs (setQuality)
+        uNearC: { value: new THREE.Vector2() }, uFarC: { value: new THREE.Vector2() }, uZ: { value: null }, uZOn: { value: 0 }, uZScale: { value: new THREE.Vector2(0.5, 0.5) },
+        uTerrQ: { value: 1 }, uCloudQ: { value: 1 },
     };
     lap('textures');
 
@@ -981,32 +1116,46 @@ export async function buildJetWorld(scene, renderer, { seed = 7, noAssets = fals
     lap('shadowBake');
 
     // ---------------------------------------------------------------- terrain meshes
-    const NEAR_R = 6000;
+    // GAME: both meshes FOLLOW THE CAMERA (world.update): the near square (+-6 km, a uniform 24 m grid) snaps to its own grid
+    // step, so its vertices stay on one world lattice (no swimming); the far ring (polar, from 5.4 km) snaps to 1 km, so its
+    // vertices re-sample the ground only once a kilometre (a small pop of ranges >5 km off, at 200 m/s every ~5 s). The far
+    // ring discards inside the NEAR square (uNearC), and its 5.4 km hole stays inside that square: |near - far centre| <=
+    // 12 + 500 m < 6,000 - 5,400. Cheaper than covering the 30 km area at 24 m (~3 M triangles); the shadow bakes already
+    // cover it (near: the whole full-resolution window; far: +-60 km).
+    const NEAR_R = 6000, NEAR_D = 24, FAR_SNAP = 1000;
     const tMat = (discard) => own(new THREE.ShaderMaterial({ uniforms: { ...U, uDiscard: { value: discard } }, vertexShader: TERRAIN_VS, fragmentShader: TERRAIN_FS }));
-    const nearMesh = new THREE.Mesh(own(nearGeometry(NEAR_R)), tMat(0));
-    nearMesh.frustumCulled = false; nearMesh.renderOrder = -2; nearMesh.name = 'terrainNear'; group.add(nearMesh);
-    // r8: the far ring in frustum-culled chunks (farChunks). The y range their spheres must hold: the far DEM's range + relief
+    // r8: the far ring in frustum-culled chunks (farChunks). The y range their spheres must hold: the DEM's range + relief
     let fLo = 1e9, fHi = -1e9; for (const D of [H.far.data, H.near?.data || []]) for (const v of D) { if (v < fLo) fLo = v; if (v > fHi) fHi = v; }
-    const farGeos = farChunks(5400, 260000, 1536, fLo - 120, fHi + 120).map(own), farMat = tMat(NEAR_R - 1);
-    const farMeshes = farGeos.map((g) => { const m = new THREE.Mesh(g, farMat); m.renderOrder = -2; m.name = 'terrainFar'; group.add(m); return m; });
-    const tris = { near: nearMesh.geometry.index.count / 3, far: farGeos.reduce((a, g) => a + g.index.count / 3, 0), farChunks: farGeos.length };
+    const nearGeos = nearChunks(NEAR_R, NEAR_D, 6, fLo - 220, fHi + 120).map(own), nearMat = tMat(0);
+    const farGeos = farChunks(FAR_RING.r0, 260000, FAR_RING.S, fLo - 120, fHi + 120).map(own), farMat = tMat(NEAR_R - 1);
+    const nearG = new THREE.Group(), farG = new THREE.Group();
+    nearG.name = 'terrainNear'; farG.name = 'terrainFar'; group.add(nearG, farG);
+    for (const g of nearGeos) { const m = new THREE.Mesh(g, nearMat); m.renderOrder = -2; nearG.add(m); }
+    for (const g of farGeos) { const m = new THREE.Mesh(g, farMat); m.renderOrder = -2; farG.add(m); }
+    const tris = { near: nearGeos.reduce((a, g) => a + g.index.count / 3, 0), far: farGeos.reduce((a, g) => a + g.index.count / 3, 0), nearChunks: nearGeos.length, farChunks: farGeos.length };
     lap('terrain');
 
     // ---------------------------------------------------------------- the cloud sea
     const n3 = own(makeNoise3D(seed));
-    const deckMat = own(new THREE.ShaderMaterial({ uniforms: { ...U, uN3: { value: n3 } }, vertexShader: DECK_VS, fragmentShader: DECK_FS, transparent: true, depthWrite: false }));
-    const deckGeo = own(new THREE.PlaneGeometry(320000, 320000, 1, 1).rotateX(-Math.PI / 2).translate(0, DECK.base + DECK.thick, 0));
+    // GAME: the march's mesh is the slab itself (320 km square, base to top): its top face seen from above (as the film's
+    // plane), its bottom face from under it, its inside faces from within; it writes the cloud's mean depth (depthOf)
+    const deckMat = own(new THREE.ShaderMaterial({ uniforms: { ...U, uN3: { value: n3 } }, vertexShader: DECK_VS, fragmentShader: DECK_FS, transparent: true, depthWrite: true, depthFunc: THREE.AlwaysDepth }));
+    const deckGeo = own(new THREE.BoxGeometry(320000, DECK.thick, 320000).translate(0, DECK.base + DECK.thick / 2, 0));
     // r8: the march draws into a half-size target (deckScene, see the half-size pass below); the scene gets the composite
     const halfRT = (depth) => {
         const rt = own(new THREE.WebGLRenderTarget(2, 2, { type: THREE.HalfFloatType, depthBuffer: depth, magFilter: depth ? THREE.NearestFilter : THREE.LinearFilter, minFilter: depth ? THREE.NearestFilter : THREE.LinearFilter, generateMipmaps: false }));
         if (depth) rt.depthTexture = new THREE.DepthTexture(2, 2, THREE.FloatType);
         return rt;
     };
-    const deckRT = halfRT(false), cumRT = halfRT(true);
+    const deckRT = halfRT(true), cumRT = halfRT(true);
+    const zMaxRT = own(new THREE.WebGLRenderTarget(2, 2, { type: THREE.FloatType, format: THREE.RedFormat, depthBuffer: false, magFilter: THREE.NearestFilter, minFilter: THREE.NearestFilter, generateMipmaps: false }));
     const deckScene = new THREE.Scene(), deckMarch = new THREE.Mesh(deckGeo, deckMat);
     deckMarch.frustumCulled = false; deckScene.add(deckMarch);
-    const deckComp = own(new THREE.ShaderMaterial({ uniforms: { uTex: { value: deckRT.texture }, uFull: { value: new THREE.Vector2(1, 1) } }, vertexShader: COMP_VS, fragmentShader: DECKC_FS, transparent: true, depthWrite: false }));
-    const deck = new THREE.Mesh(deckGeo, deckComp);
+    deckMarch.onBeforeRender = (r, sc, cam) => { const y = cam.position.y, inside = y > DECK.base - 1 && y < DECK.base + DECK.thick + 1; deckMat.side = inside ? THREE.BackSide : THREE.FrontSide; };
+    const triGeo = own(new THREE.BufferGeometry());
+    triGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array([-1, -1, 0, 3, -1, 0, -1, 3, 0]), 3));   // one triangle over the screen
+    const deckComp = own(new THREE.ShaderMaterial({ uniforms: { uTex: { value: deckRT.texture }, uDep: { value: deckRT.depthTexture }, uFull: { value: new THREE.Vector2(1, 1) }, uHalfN: { value: new THREE.Vector2(1, 1) } }, vertexShader: CUMC_VS, fragmentShader: DECKC_FS, transparent: true, depthWrite: false }));
+    const deck = new THREE.Mesh(triGeo, deckComp);
     deck.frustumCulled = false; deck.renderOrder = 1; deck.name = 'cloudSea';
     group.add(deck);
 
@@ -1014,10 +1163,12 @@ export async function buildJetWorld(scene, renderer, { seed = 7, noAssets = fals
     const rc = mulberry32(seed * 104729 + 3);
     const clusters = [], cumulus = [];
     // r8: the boxes live in their own scene, marched at half size over a depth-only copy of the terrain (same chunks, culled)
-    const cumScene = new THREE.Scene();
+    const cumScene = new THREE.Scene(), boxScene = new THREE.Scene();   // GAME: terrain depth first, then (after the max pass) the boxes
     const tDepth = (discard) => own(new THREE.ShaderMaterial({ uniforms: { ...U, uDiscard: { value: discard } }, vertexShader: TERRAIN_VS, fragmentShader: TDEPTH_FS, colorWrite: false }));
-    { const n = new THREE.Mesh(nearMesh.geometry, tDepth(0)); n.frustumCulled = false; n.renderOrder = -2; cumScene.add(n);
-      const fd = tDepth(NEAR_R - 1); for (const g of farGeos) { const m = new THREE.Mesh(g, fd); m.renderOrder = -2; cumScene.add(m); } }
+    // GAME: the same pass is also this frame's terrain depth for the terrain shader's early out (uZ)
+    const cumNearG = new THREE.Group(), cumFarG = new THREE.Group(); cumScene.add(cumNearG, cumFarG);
+    { const nd = tDepth(0); for (const g of nearGeos) { const m = new THREE.Mesh(g, nd); m.renderOrder = -2; cumNearG.add(m); }
+      const fd = tDepth(NEAR_R - 1); for (const g of farGeos) { const m = new THREE.Mesh(g, fd); m.renderOrder = -2; cumFarG.add(m); } }
     // r6: flat-based cumulus and stratocumulus, clearly bigger than a jet: R the half width of the cell field (0.9-3 km), Hh
     // its depth (0.25-1.8 km), a base at one condensation level. Each is placed by trial: a cloud whose base comes within 450 m
     // of the ground under it (a "column rooted on a peak", seed 7 review) or whose box comes within 600 m of the fight box
@@ -1046,7 +1197,7 @@ export async function buildJetWorld(scene, renderer, { seed = 7, noAssets = fals
         const arr = Array.from({ length: 10 }, (_, i) => blobs[i] ? new THREE.Vector4(blobs[i][0] - mid[0], blobs[i][1] - mid[1], blobs[i][2] - mid[2], blobs[i][3]) : new THREE.Vector4(0, 0, 0, 0));
         const mat = own(new THREE.ShaderMaterial({
             uniforms: { ...U, uN3: { value: n3 }, uBlobs: { value: arr }, uHalf: { value: V(...half) }, uOff: { value: V(rc() * 5000, rc() * 5000, rc() * 5000) }, uBaseY: { value: -mid[1] - 0 }, uSig: { value: 0.042 }, uFlat: { value: flat } },
-            vertexShader: CUM_VS, fragmentShader: CUM_FS, transparent: true, depthWrite: false,
+            vertexShader: CUM_VS, fragmentShader: CUM_FS, transparent: true, depthWrite: true,   // GAME: writes its mean depth
         }));
         const box = new THREE.Mesh(own(new THREE.BoxGeometry(half[0] * 2, half[1] * 2, half[2] * 2)), mat);
         box.renderOrder = 2; box.name = 'cumulusBox';   // r8: frustum-culled (a box round the camera always meets the frustum)
@@ -1055,9 +1206,9 @@ export async function buildJetWorld(scene, renderer, { seed = 7, noAssets = fals
         // the camera inside the box: draw its back faces, unoccluded (the march starts at the lens)
         box.onBeforeRender = (r, s, cam) => {
             const p = cam.position, o = box.position, inside = Math.abs(p.x - o.x) < half[0] + 2 && Math.abs(p.y - o.y) < half[1] + 2 && Math.abs(p.z - o.z) < half[2] + 2;
-            mat.side = inside ? THREE.BackSide : THREE.FrontSide; mat.depthTest = !inside;
+            mat.side = inside ? THREE.BackSide : THREE.FrontSide; mat.depthFunc = inside ? THREE.AlwaysDepth : THREE.LessEqualDepth;
         };
-        cumScene.add(box); cumulus.push(box);
+        boxScene.add(box); cumulus.push(box);
         clusters.push({ c: [cx, yb, cz], r: Math.max(half[0], half[2]), h: half[1] * 2, centre });
         return true;
     };
@@ -1086,13 +1237,13 @@ export async function buildJetWorld(scene, renderer, { seed = 7, noAssets = fals
     let skyEnv;
     {
         // (the cumulus are not in the group -- a cloud at the lens would fill half the cube; r8: the deck is baked by its march)
-        deck.material = deckMat;
+        deck.visible = false; group.add(deckMarch);   // GAME: the march itself (the composite needs the half-size pass)
         const envScene = new THREE.Scene(); envScene.background = bgRT.texture;
         scene.remove(group); envScene.add(group);
         const small = new THREE.WebGLCubeRenderTarget(256, { type: THREE.HalfFloatType });
         const cc = new THREE.CubeCamera(5, 400000, small); cc.position.set(...FIGHT.centre);
         cc.update(renderer, envScene);
-        envScene.remove(group); scene.add(group); deck.material = deckComp;
+        envScene.remove(group); scene.add(group); deckScene.add(deckMarch); deck.visible = true;
         const pmrem = new THREE.PMREMGenerator(renderer);
         skyEnv = own(pmrem.fromCubemap(small.texture).texture);
         pmrem.dispose(); small.dispose();
@@ -1109,6 +1260,8 @@ export async function buildJetWorld(scene, renderer, { seed = 7, noAssets = fals
         vertexShader: CUMC_VS, fragmentShader: CUMC_FS, transparent: true, depthWrite: false,
     }));
     if (!cumulus.length) { cumComp.uniforms.uBC.value = [V()]; cumComp.uniforms.uBH.value = [V()]; }
+    const zMaxScene = new THREE.Scene(), zMaxQuad = new THREE.Mesh(cumGeo.clone(), own(new THREE.ShaderMaterial({ uniforms: { uDep: { value: cumRT.depthTexture } }, vertexShader: CUMC_VS, fragmentShader: ZMAX_FS, depthTest: false, depthWrite: false })));
+    zMaxQuad.frustumCulled = false; zMaxScene.add(zMaxQuad); own(zMaxQuad.geometry);
     const cumC = new THREE.Mesh(cumGeo, cumComp);
     cumC.frustumCulled = false; cumC.renderOrder = 2; cumC.name = 'cumulus';
     group.add(cumC);
@@ -1117,35 +1270,47 @@ export async function buildJetWorld(scene, renderer, { seed = 7, noAssets = fals
     const fitRT = (rt, w, h) => { if (rt.width !== w || rt.height !== h) rt.setSize(w, h); };
     // Runs at the start of every render of the scene, before anything is drawn into its target (three calls scene.onBeforeRender
     // before it builds its lists), so the two marches never interrupt the scene's own (MSAA) target mid-pass.
+    // GAME: the half-size terrain depth (cumScene's terrain) is drawn on EVERY frame now, not only when a cumulus is in view:
+    // the terrain shader reads it (uZ) to drop hidden fragments early. It stays terrain-only (the boxes write no depth).
+    const knobs = { hiZ: true };   // GAME: world.hiZ (debug/A-B: the terrain early out on or off)
     const cloudPass = (r, cam, target) => {
+        U.uZOn.value = 0;
         if (!group.parent || !group.visible || !cam.isPerspectiveCamera) { cumGeo.setDrawRange(0, 0); return; }
         let w, h;
         if (target) { w = Math.floor(target.width); h = Math.floor(target.height); } else { r.getDrawingBufferSize(_v2); w = _v2.x; h = _v2.y; }
-        const hw = Math.max(1, Math.ceil(w / 2)), hh = Math.max(1, Math.ceil(h / 2));
+        const hw = Math.max(2, Math.ceil(w / 2)), hh = Math.max(2, Math.ceil(h / 2));
         _fr.setFromProjectionMatrix(_m4.multiplyMatrices(cam.projectionMatrix, cam.matrixWorldInverse));
         let anyBox = false;
-        cumScene.updateMatrixWorld();
-        if (cumC.visible) for (const b of cumulus) if (_fr.intersectsSphere(_sp.copy(b.geometry.boundingSphere).applyMatrix4(b.matrixWorld))) { anyBox = true; break; }
-        if (!deck.visible && !anyBox) { cumGeo.setDrawRange(0, 0); return; }
+        cumNearG.visible = nearG.visible; cumFarG.visible = farG.visible;
+        cumScene.updateMatrixWorld(); boxScene.updateMatrixWorld();
+        for (let i = 0; i < NP; i++) { const b = cumulus[i]; b.visible = cumC.visible; if (b.visible && !anyBox && _fr.intersectsSphere(_sp.copy(b.geometry.boundingSphere).applyMatrix4(b.matrixWorld))) anyBox = true; }
         const prev = r.getRenderTarget(), face = r.getActiveCubeFace(), mip = r.getActiveMipmapLevel();
         r.getClearColor(_cc); const ca = r.getClearAlpha(), ac = r.autoClear;
         r.setClearColor(0x000000, 0); r.autoClear = false;
+        fitRT(cumRT, hw, hh); r.setRenderTarget(cumRT); r.clear(true, true, false); r.render(cumScene, cam);
+        const qw = Math.ceil(hw / 2), qh = Math.ceil(hh / 2);
+        fitRT(zMaxRT, qw, qh); r.setRenderTarget(zMaxRT); r.render(zMaxScene, cam);
+        U.uZ.value = zMaxRT.texture; U.uZScale.value.set(qw / w, qh / h); U.uZOn.value = knobs.hiZ ? 1 : 0;
         if (deck.visible) {
-            fitRT(deckRT, hw, hh); r.setRenderTarget(deckRT); r.clear(true, false, false); r.render(deckScene, cam);
-            deckComp.uniforms.uFull.value.set(w, h);
+            fitRT(deckRT, hw, hh); r.setRenderTarget(deckRT); r.clear(true, true, false); r.render(deckScene, cam);
+            deckComp.uniforms.uFull.value.set(w, h); deckComp.uniforms.uHalfN.value.set(hw, hh);
+            // from in or under the slab the sea is in front of every cumulus (their bases stand >1 km over its top): composite it last
+            deck.renderOrder = cam.position.y < DECK.base + DECK.thick ? 3 : 1;
         }
         if (anyBox) {
-            fitRT(cumRT, hw, hh); r.setRenderTarget(cumRT); r.clear(true, true, false); r.render(cumScene, cam);
+            r.setRenderTarget(cumRT); r.render(boxScene, cam);   // over the terrain depth (no clear): the boxes write their mean depth
             const u = cumComp.uniforms, P = cam.projectionMatrix.elements;
             u.uFull.value.set(w, h); u.uHalfN.value.set(hw, hh);
             u.uCamRot.value.setFromMatrix4(cam.matrixWorld); u.uProj.value.set(P[0], P[5], P[8], P[9]);
-            cumulus.forEach((b, i) => u.uBC.value[i].copy(b.position));
+            for (let i = 0; i < NP; i++) u.uBC.value[i].copy(cumulus[i].position);
             cumGeo.setDrawRange(0, 3);
         } else cumGeo.setDrawRange(0, 0);
         r.setRenderTarget(prev, face, mip); r.setClearColor(_cc, ca); r.autoClear = ac;
     };
-    const prevHook = scene.onBeforeRender;
+    const prevHook = scene.onBeforeRender, prevAfter = scene.onAfterRender;
     scene.onBeforeRender = function (r, sc, cam, target) { prevHook.call(this, r, sc, cam, target); cloudPass(r, cam, target); };
+    // the early-out depth belongs to this one render: any other render of these materials (an env cube, another scene) skips it
+    scene.onAfterRender = function (r, sc, cam) { prevAfter.call(this, r, sc, cam); U.uZOn.value = 0; };
 
     const applyEnv = (obj, k = 1) => obj.traverse((o) => {
         for (const m of [].concat(o.material || [])) if (m.isMeshStandardMaterial) { m.envMap = skyEnv; m.envMapIntensity = k; m.needsUpdate = true; }
@@ -1160,11 +1325,41 @@ export async function buildJetWorld(scene, renderer, { seed = 7, noAssets = fals
     };
     let terrainMaxInBox = -1e9;
     for (let x = FIGHT.min[0]; x <= FIGHT.max[0]; x += 25) for (let z = FIGHT.min[2]; z <= FIGHT.max[2]; z += 25) terrainMaxInBox = Math.max(terrainMaxInBox, terrainHeightAt(x, z));
+    // GAME: the terrain round (x, z): the near square on its 24 m lattice, the far ring on its 1 km one (see NEAR_R)
+    const follow = (x, z) => {
+        const nx = Math.round(x / NEAR_D) * NEAR_D, nz = Math.round(z / NEAR_D) * NEAR_D, fx = Math.round(x / FAR_SNAP) * FAR_SNAP, fz = Math.round(z / FAR_SNAP) * FAR_SNAP;
+        nearG.position.set(nx, 0, nz); cumNearG.position.set(nx, 0, nz); farG.position.set(fx, 0, fz); cumFarG.position.set(fx, 0, fz);
+        U.uNearC.value.set(nx, nz); U.uFarC.value.set(fx, fz);
+    };
+    // GAME: the spawn's run, checked on the drawn ground: the least clearance over the 8 km ahead at the spawn's height
+    let spawnClear = 1e9;
+    for (let d = 0; d <= 8000; d += 25) spawnClear = Math.min(spawnClear, SPAWN.pos[1] - terrainHeightAt(SPAWN.pos[0] + Math.sin(SPAWN.heading) * d, SPAWN.pos[2] - Math.cos(SPAWN.heading) * d));
+    if (spawnClear < 60) console.warn(`[jet] spawn run clearance only ${Math.round(spawnClear)} m`);
+    // GAME: the cloud sea's top at (x, z) and time t, world y (= deck.base where the sea is clear): the CPU twin of the
+    // shader's deckTop (5 octaves; the billow erosion is left out), so the game can tell when a jet is in the cloud sea
+    const deckTopAt = (x, z, tt = 0) => {
+        const qx = x - WIND[0] * tt, qz = z - WIND[1] * tt, big = tnC(qx / 7000 + 31, qz / 7000 + 31);
+        let f = 0, a = 0.5, norm = 0, sx = qx / 1300, sz = qz / 1300;
+        for (let i = 0; i < 5; i++) { f += a * tnC(sx, sz); norm += a; sx = sx * 2.07 + 17.3; sz = sz * 2.07 + 17.3; a *= 0.5; }
+        f = (f / norm - 0.5) * 1.9 + 0.5;
+        const m = f - (1 - (0.15 + 0.65 * smooth(0.25, 0.75, big)));
+        return DECK.base + (m > 0 ? DECK.thick * smooth(0, 0.45, m) : 0);
+    };
+    // GAME: quality knobs for the engine (2 = the film's look; 1, 0 = cheaper): the cloud marches' step count and the reach
+    // of the terrain's micro-normal (the per-pixel 3-D noise near the lens)
+    const QUALITY = [{ cloud: 0.5, terr: 0.35 }, { cloud: 0.7, terr: 0.6 }, { cloud: 1, terr: 1 }];
+    let qLevel = 2;
+    const setQuality = (level) => { qLevel = clamp(Math.round(level), 0, 2); U.uCloudQ.value = QUALITY[qLevel].cloud; U.uTerrQ.value = QUALITY[qLevel].terr; return qLevel; };
     const cloudsAt = (tt) => cumulus.map((b) => ({ c: [b.userData.c0[0] + WIND[0] * tt, b.userData.c0[1], b.userData.c0[2] + WIND[1] * tt], half: b.userData.half.slice() }));
 
     const world = {
         group,
-        update(tt /* , sample: unused */) { U.uTime.value = tt; for (const c of cumulus) c.position.set(c.userData.c0[0] + WIND[0] * tt, c.userData.c0[1], c.userData.c0[2] + WIND[1] * tt); },
+        // GAME: update(t, camera): the drift, and the terrain meshes follow the camera (no allocation)
+        update(tt, camera) {
+            U.uTime.value = tt;
+            for (let i = 0; i < NP; i++) { const c = cumulus[i], c0 = c.userData.c0; c.position.set(c0[0] + WIND[0] * tt, c0[1], c0[2] + WIND[1] * tt); }
+            if (camera) follow(camera.position.x, camera.position.z);
+        },
         sunDir, sunColor: SUN_COL.clone(), sunIntensity: SUN_E, sunLight, skyEnv, applyEnv,
         exposure: 0.8,
         toneMapping: THREE.ACESFilmicToneMapping,   // research B6 (ACES); jetworld.js was tuned under it
@@ -1172,10 +1367,14 @@ export async function buildJetWorld(scene, renderer, { seed = 7, noAssets = fals
         fightBox: FIGHT,
         deck: { base: DECK.base, top: DECK.base + DECK.thick },
         terrainHeightAt, sunVisibilityAt, cloudsAt,
+        get hiZ() { return knobs.hiZ; }, set hiZ(v) { knobs.hiZ = !!v; },
+        deckTopAt, setQuality, get quality() { return qLevel; },
+        playArea: { ...PLAY },                                              // GAME: README contract
+        spawn: { pos: SPAWN.pos.slice(), heading: SPAWN.heading, speed: SPAWN.speed },
         credit: H.credit,
-        stats: { ms: { ...ms, total: Math.round(performance.now() - T0) }, tris: { ...tris, total: tris.near + tris.far + 2 + NP * 12 }, cumulus: NP, clusters: clusters.length, nearRing: nNear, dem: !!H.near, terrainMaxInBox: Math.round(terrainMaxInBox), amb: { up: U.uAmbUp.value.toArray().map((v) => +v.toFixed(3)), hor: U.uAmbHor.value.toArray().map((v) => +v.toFixed(3)) } },
+        stats: { ms: { ...ms, total: Math.round(performance.now() - T0) }, tris: { ...tris, total: tris.near + tris.far + 2 + NP * 12 }, cumulus: NP, clusters: clusters.length, spawnClear: Math.round(spawnClear), nearRing: nNear, dem: !!H.near, terrainMaxInBox: Math.round(terrainMaxInBox), amb: { up: U.uAmbUp.value.toArray().map((v) => +v.toFixed(3)), hor: U.uAmbHor.value.toArray().map((v) => +v.toFixed(3)) } },
         dispose() {
-            scene.remove(group); scene.onBeforeRender = prevHook;
+            scene.remove(group); scene.onBeforeRender = prevHook; scene.onAfterRender = prevAfter;
             if (scene.background === bgRT.texture) scene.background = null;
             for (const d of disposables) d.dispose?.();
         },

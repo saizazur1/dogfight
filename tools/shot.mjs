@@ -28,7 +28,7 @@ try {
   await send('Runtime.enable');
   await send('Page.navigate', { url });
   await sleep(+waitMs);
-  if (evalJS) { await send('Runtime.evaluate', { expression: evalJS, awaitPromise: true }); await sleep(3000); }
+  if (evalJS) { const ev = await send('Runtime.evaluate', { expression: `(async () => { ${evalJS} })()`, awaitPromise: true }); if (ev.result?.exceptionDetails) console.log('EVAL ERROR:', ev.result.exceptionDetails.exception?.description); await sleep(500); }
   const r = await send('Page.captureScreenshot', { format: 'png' });
   writeFileSync(out, Buffer.from(r.result.data, 'base64'));
   console.log(logs.slice(-15).join('\n'));
