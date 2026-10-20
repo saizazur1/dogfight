@@ -270,6 +270,7 @@ export function createRaceMode(game) {
         if (next === 0) t0 = game.t;
         game.sound?.oneShot?.('pop');
         next++;
+        game.emit?.({ type: 'ring', n: next });
         if (next === course.rings.length) {
           done = true;
           const t = game.t - t0, best = loadBest(), rec = !practice && (!best || t < best);

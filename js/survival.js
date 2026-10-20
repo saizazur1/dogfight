@@ -61,7 +61,7 @@ export function createSurvivalMode(game) {
     step(dt) {
       phaseT += dt;
       if (phase === 'breather' && phaseT >= BREATHER) spawnWave();
-      else if (phase === 'fight' && !anyAlive()) { phase = 'cleared'; phaseT = 0; }
+      else if (phase === 'fight' && !anyAlive()) { phase = 'cleared'; phaseT = 0; game.emit?.({ type: 'wave', n: w }); }
       else if (phase === 'cleared' && phaseT >= CLEAR_DELAY) breather();
       else if (phase === 'dead' && phaseT >= END_DELAY) {
         const best = readBest();

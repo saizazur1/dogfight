@@ -328,7 +328,7 @@ export function createCombat({ terrainHeightAt, seed = 1, onEvent = null }) {
           if (SEG.d2 < T.mFuse * T.mFuse) {
             m.alive = false;
             for (let j = 0; j < 3; j++) S3[j] = S2[j] + (m.pos[j] - S2[j]) * u;
-            emit({ type: 'missileHit', missile: m.id, target: g.id, pos: [S3[0], S3[1], S3[2]] });
+            emit({ type: 'missileHit', missile: m.id, owner: m.owner, target: g.id, pos: [S3[0], S3[1], S3[2]] });
             damage(g, T.mDamage, m.owner, 'missile');
           }
         }

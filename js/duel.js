@@ -36,6 +36,7 @@ export function createDuelMode(game) {
   /** won: true = me, false = the AI, null = draw (replayed). */
   function endRound(won, sub) {
     phase = 'over'; phaseT = 0;
+    if (won !== null && won !== undefined) game.emit?.({ type: 'round', result: won ? 'win' : 'lose' });
     if (won === true) { score.me++; game.cards.show('roundWin', { text: 'ROUND WON', sub, ms: ROUND_END * 1000 }); }
     else if (won === false) { score.enemy++; game.cards.show('roundLose', { text: 'ROUND LOST', sub, ms: ROUND_END * 1000 }); }
     else { phase = 'draw'; game.cards.show('round', { text: 'DRAW', sub: sub || 'Nobody scores · the round is flown again', ms: ROUND_END * 1000 }); }

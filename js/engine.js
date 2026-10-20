@@ -22,7 +22,7 @@
 //   const engine = await createEngine({ canvas, params });
 //   engine.renderer / scene / camera / composer
 //   engine.configure({ bloom, exposure, toneMapping })   engine.setBusy(bool)   engine.calm()
-//   await engine.warmUp(fns)   engine.run(step, frame)   engine.stop()   engine.stats   engine.onPerf
+//   await engine.warmUp(fns)   engine.run(step, frame)   engine.stop()   engine.stats   engine.onPerf   engine.timeScale (1; < 1 slow motion)
 
 import * as THREE from 'three';
 import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
@@ -262,12 +262,13 @@ export async function createEngine({ canvas, params = new URLSearchParams(locati
   const tick = (now) => {
     raf = requestAnimationFrame(tick);
     const dtReal = lastT ? (now - lastT) / 1000 : 0; lastT = now;
-    acc += Math.min(dtReal, MAX_CATCHUP);
+    const dtSim = Math.min(dtReal, MAX_CATCHUP) * engine.timeScale;   // timeScale < 1 = slow motion (a kill shot)
+    acc += dtSim;
     let n = 0;
     while (acc >= STEP && n < MAX_STEPS) { engine._step(STEP); acc -= STEP; n++; }
     if (acc >= STEP) { acc %= STEP; stats.dropped += 1; }   // spiral guard: a backlog beyond 8 steps is dropped, not chased
     stats.steps = n;
-    engine._frame(acc / STEP, Math.min(dtReal, MAX_CATCHUP));
+    engine._frame(acc / STEP, dtSim);
     gpu.poll();
     const timing = gpu.begin();
     composer.render();
@@ -280,7 +281,7 @@ export async function createEngine({ canvas, params = new URLSearchParams(locati
   const macrotask = () => new Promise((r) => setTimeout(r, 0));
 
   const engine = {
-    renderer, scene, camera, composer, bloom, stats, onPerf: null,
+    renderer, scene, camera, composer, bloom, stats, onPerf: null, timeScale: 1,
     _step: null, _frame: null,
 
     /**

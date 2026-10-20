@@ -10,6 +10,9 @@
  * Extras beyond the README object: game.weaponsOff (true = no weapons and no combat.step, e.g. a countdown), game.score
  * (the HUD's {me, enemy, round} line, or null), game.nearest (closest live other fighter to me; the HUD / sound "enemy").
  * A mode with weapons === false (the race) has gun / missile / flare input cleared every step.
+ * Hooks (README "Hooks contract"), each optional and fenced by try/catch: hype.js (juice + announcer), progress.js / trails.js /
+ * locker.js (XP, unlocks), powerups.js / powerupfx.js (pick-ups, supply drops; a mode opts in with `powerups`), chaos.js.
+ * game.emit(e) sends a mode's own event (round / wave / ring) down the same stream as combat's.
  */
 import * as THREE from 'three';
 import { buildJet } from './jetmodel.js';
@@ -32,7 +35,7 @@ const $ = (id) => document.getElementById(id);
 const PALETTE = ['#c8362c', '#2b62cf', '#e0a020', '#3a9d5a', '#8a4fd0', '#e7e7ea', '#2a2d33', '#e0663a'];
 const AI_NAMES = ['Viper', 'Kestrel', 'Raptor', 'Talon', 'Ghost', 'Harrier', 'Osprey', 'Merlin'];
 const POOL_MAX = 8;
-const PREBUILD = 5;          // me + 4 AIs (survival's most) built behind the loading screen; more are built on demand
+const PREBUILD = 8;          // me + 7 AIs (Chaos) built behind the loading screen
 const SPAWN_CLEAR = 600, SPAWN_RUN = 6000, SPAWN_SPEED = 230;
 
 /** Loads an optional module's factory (race / tutorial / radar are written by other lanes); null if missing or broken. */
@@ -52,9 +55,12 @@ export async function createGame({ engine, world, menu, params, progress = () =>
   const BOT = params.has('bot');   // test only: an AI flies the player's jet too (robot play-tests, screenshots)
   const seed0 = +(params.get('seed') || 7);
 
-  const [createRaceMode, createTutorialMode, createRadar] = await Promise.all([
-    optional('./race.js', 'createRaceMode'), optional('./tutorial.js', 'createTutorialMode'), optional('./radar.js', 'createRadar')]);
-  const MODES = { duel: createDuelMode, survival: createSurvivalMode, race: createRaceMode, tutorial: createTutorialMode };
+  const [createRaceMode, createTutorialMode, createRadar, createChaosMode, createHype, createProgress, createTrails, createLocker, createPowerups, createPowerupFx] = await Promise.all([
+    optional('./race.js', 'createRaceMode'), optional('./tutorial.js', 'createTutorialMode'), optional('./radar.js', 'createRadar'),
+    optional('./chaos.js', 'createChaosMode'), optional('./hype.js', 'createHype'), optional('./progress.js', 'createProgress'),
+    optional('./trails.js', 'createTrails'), optional('./locker.js', 'createLocker'), optional('./powerups.js', 'createPowerups'),
+    optional('./powerupfx.js', 'createPowerupFx')]);
+  const MODES = { duel: createDuelMode, survival: createSurvivalMode, race: createRaceMode, tutorial: createTutorialMode, chaos: createChaosMode };
 
   progress(0.7, 'Rolling out the jets…');
   const controls = createControls({ canvas: $('stage') });
@@ -93,6 +99,24 @@ export async function createGame({ engine, world, menu, params, progress = () =>
   const wfx = createWeaponFx(scene, { buildMissile: me.jet.buildMissile, world });
   const combat = createCombat({ terrainHeightAt: th, seed: seed0, onEvent });
   combat.add(me);
+  // ---- hooks (README "Hooks contract"): each one optional; a hook that throws is switched off, the game goes on
+  const hooks = {};
+  const hook = (name, fn) => { try { return fn(); } catch (e) { console.warn(`game: ${name} off`, e); hooks[name] = null; return undefined; } };
+  hooks.hype = createHype && hook('hype', () => createHype(document.body, { sound }));
+  hooks.prog = createProgress && hook('prog', () => createProgress());
+  hooks.trails = createTrails && hook('trails', () => createTrails(scene, world));
+  hooks.pu = createPowerups && hook('pu', () => createPowerups({ terrainHeightAt: th, playArea: world.playArea, seed: seed0, onEvent, combat }));
+  hooks.pfx = createPowerupFx && hook('pfx', () => createPowerupFx(scene, world));
+  hooks.locker = createLocker && hooks.prog && hook('locker', () => createLocker(document.body, hooks.prog, { onEquip: () => dressMe() }));
+  const H = (name, fn) => { const h = hooks[name]; if (h) hook(name, () => fn(h)); };
+  const byId = (id) => pool[id] || null;
+  const hypeCtx = { meId: 0, byId, me: null, modeId: null };
+  /** My jet wears what the locker has equipped (finish now; the trail style is set per spawn). */
+  function dressMe() {
+    const eq = hooks.prog?.state?.equipped || {};
+    if (me.jet.finish) hook('finish', () => me.jet.finish(eq.finish || 'gloss'));
+    H('trails', (tr) => tr.set(me, eq.trail || 'vapor'));
+  }
 
   let phase = 'menu', resumePhase = 'play', mode = null, modeId = null, view = 'chase', t = 0, seedN = seed0 * 1000, stepping = false;
   const modeInst = {}, outOfCombat = [];
@@ -111,7 +135,9 @@ export async function createGame({ engine, world, menu, params, progress = () =>
     f.ctl.gun = f.ctl.missile = f.ctl.flare = false;
     f.ctl.aim[0] = Math.sin(heading); f.ctl.aim[1] = 0; f.ctl.aim[2] = -Math.cos(heading);
     f.ctl.throttle = 0.84; f.ctl.ab = false;
+    f.shield = 0; f.s.boost = 0;
     f.jet.group.visible = true;
+    H('trails', (tr) => tr.clear(f));
     placeJet(f, 1);
   }
 
@@ -129,6 +155,7 @@ export async function createGame({ engine, world, menu, params, progress = () =>
     f.target = null;
     place(f, { pos, heading, speed });
     f.ai = createAI(f, { skill, env, combat, seed: ++seedN });
+    H('trails', (tr) => tr.set(f, 'vapor'));
     fighters.push(f);
     return f;
   }
@@ -181,16 +208,23 @@ export async function createGame({ engine, world, menu, params, progress = () =>
   const setBanner = (text) => { try { hud.setBanner?.(text); } catch (e) { console.warn('game: setBanner', e); } };
 
   /** README: ends the mode with a big card; Space plays it again, Esc goes to the menu. */
-  function finish({ title, sub = '', won } = {}) {
+  function finish({ title, sub = '', won, place } = {}) {
     if (phase !== 'play') return;
+    emit({ type: 'match', result: won === false ? 'lose' : won === null ? 'draw' : 'win', place, modeId });
     phase = 'finished';
+    engine.timeScale = 1;
     cards.show(won === false ? 'lose' : 'win', { text: title, sub: `${sub ? `${sub} · ` : ''}Space: again · Esc: menu`, ms: 0 });
+    H('prog', (pr) => { const sum = pr.matchEnd({ modeId, won: won !== false && won !== null }); H('locker', (lk) => lk.showResult(sum)); });
     engine.setBusy(false); engine.calm();
   }
+  /** README: a mode's own event (round / wave / ring) into the same stream as combat's. */
+  function emit(e) { e.t = t; onEvent(e); }
 
   /** Every combat event: HUD, sound, effects; a shot-down jet is hidden (a burst unless it hit the ground); then the mode. */
   function onEvent(e) {
     hud.onEvent(e, me.id); sound.onEvent(e, me.id); wfx.onEvent(e);
+    H('hype', (hy) => hy.onEvent(e, hypeCtx));
+    if (phase === 'play') H('prog', (pr) => pr.onEvent(e, me.id, modeId));
     if (e.type === 'kill') {
       const victim = pool[e.victim];
       if (victim) { victim.jet.group.visible = false; if (e.cause !== 'crash') wfx.burst(victim.s.pos, victim.s.vel, 3); }
@@ -238,6 +272,7 @@ export async function createGame({ engine, world, menu, params, progress = () =>
     if (!game.weaponsOff) {
       stepping = true; combat.step(dt); stepping = false;
       while (outOfCombat.length) dropFromCombat(outOfCombat.pop());
+      if (game.powerups) H('pu', (pu) => pu.step(dt, fighters));
     }
     if (phase === 'play') mode.step(dt);
     controls.consumeEdges();
@@ -252,14 +287,17 @@ export async function createGame({ engine, world, menu, params, progress = () =>
     }
     if (view === 'cockpit') cockpit.update(frameDt, me.pose, controls.look, me.s);
     else cam.update(frameDt, me.pose, controls.ctl.aim, me.s, controls.look);
+    if (phase !== 'menu') H('hype', (hy) => { hy.frame(frameDt, camera, me, view); engine.timeScale = phase === 'play' ? hy.slowmo : 1; });
     world.update(t, camera);
     wfx.update(frameDt, combat, camera);
+    H('trails', (tr) => tr.update(frameDt, fighters, camera));
+    H('pfx', (px) => px.update(frameDt, game.powerups, fighters, camera));
     if (mode && phase !== 'menu') mode.frame?.(frameDt);
     fight.enemy = game.nearest; fight.score = game.score; fight.noWeapons = !!mode && mode.weapons === false;
     hud.setMode(view, view === 'cockpit' ? hudRectFor() : undefined);
     hud.setFight(phase === 'menu' ? null : fight);
     hud.update(camera, me.pose, controls.ctl.aim, me.s);
-    if (radar) try { radar.update(me, fighters, combat, world.playArea, camera); } catch (e) { console.warn('game: radar.update', e); radar = null; }
+    if (radar) try { radar.update(me, fighters, combat, world.playArea, camera, game.powerups?.items); } catch (e) { console.warn('game: radar.update', e); radar = null; }
     sound.setFight(fight);
     sound.update(camera, me.s, view);
   }
@@ -277,8 +315,9 @@ export async function createGame({ engine, world, menu, params, progress = () =>
   function stopMode() {
     if (mode) { try { mode.stop?.(); } catch (e) { console.error('game: mode.stop', e); } }
     while (fighters.length > 1) despawn(fighters[fighters.length - 1]);
-    mode = null; game.mode = null;
-    game.weaponsOff = false; game.score = null; game.nearest = null;
+    if (game.powerups) H('pu', (pu) => pu.stop());
+    mode = null; game.mode = null; game.powerups = null;
+    game.weaponsOff = false; game.score = null; game.nearest = null; engine.timeScale = 1;
     setBanner(null); cards.hide();
   }
 
@@ -295,6 +334,11 @@ export async function createGame({ engine, world, menu, params, progress = () =>
     mode = modeInst[id] ||= MODES[id](game);
     game.mode = mode;
     phase = 'play';
+    hypeCtx.me = me; hypeCtx.modeId = id;
+    H('hype', (hy) => hy.reset());
+    H('prog', (pr) => pr.matchStart(id));
+    dressMe();
+    if (mode.powerups && hooks.pu) { game.powerups = hooks.pu; H('pu', (pu) => pu.start(mode.powerups)); }
     sound.start(); sound.pause(false);
     menu.show('none'); showHud(true);
     engine.setBusy(true);
@@ -315,15 +359,17 @@ export async function createGame({ engine, world, menu, params, progress = () =>
     controls.setInvertY(st.invertY);
     sound.setVolume(st.volume);
     world.setQuality(st.quality);
+    H('hype', (hy) => hy.setVoice(st.voice !== false));
     $('fps').classList.toggle('hidden', !st.showFps);
   };
 
   const game = {
     world, scene, camera, env, combat, controls, hud, cards, sound, wfx, params, profile: menu.profile,
-    me, fighters, spawnAI, despawn, respawnMe, safeSpawn, setBanner, finish,
+    me, fighters, spawnAI, despawn, respawnMe, safeSpawn, setBanner, finish, emit,
     get t() { return t; }, get phase() { return phase; },
-    mode: null, nearest: null, weaponsOff: false, score: null, pool,
+    mode: null, nearest: null, weaponsOff: false, score: null, pool, powerups: null, hooks,
     play, resume, quit, applySettings,
+    openLocker: () => H('locker', (lk) => lk.open()),
   };
 
   // ---- warm-up: the scene from a few angles, every pooled jet in view once (uploads its geometry), one of every weapon effect

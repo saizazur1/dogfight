@@ -37,6 +37,7 @@ async function boot() {
     onResume: () => game?.resume(),
     onQuit: () => game?.quit(),
     onChange: (st) => game?.applySettings(st),
+    onLocker: () => game?.openLocker(),
   });
   game = await createGame({ engine, world, menu, params, progress });
 }
