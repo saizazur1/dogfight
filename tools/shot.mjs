@@ -1,14 +1,15 @@
 // node shot.mjs <url> <out.png> [waitMs] [w] [h] [dpr] [evalJS]
 // Launches its own headless Chrome on port 9333, waits real time, screenshots, kills only that Chrome.
 import { spawn } from 'node:child_process';
-import { writeFileSync, mkdtempSync } from 'node:fs';
+import { writeFileSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 const [url, out, waitMs = '15000', w = '1280', h = '720', dpr = '1', evalJS = ''] = process.argv.slice(2);
 const PORT = +(process.env.PORT || 9333);   // each lane uses its own debugging port
+const profile = mkdtempSync(join(tmpdir(), 'shot-'));   // removed again in finally (230 leftovers once filled the disk)
 const chrome = spawn('/Applications/Google Chrome.app/Contents/MacOS/Google Chrome', [
-  '--headless=new', `--remote-debugging-port=${PORT}`, `--user-data-dir=${mkdtempSync(join(tmpdir(), 'shot-'))}`,
+  '--headless=new', `--remote-debugging-port=${PORT}`, `--user-data-dir=${profile}`,
   '--enable-gpu', '--use-angle=metal', '--ignore-gpu-blocklist', '--hide-scrollbars', '--mute-audio',
   `--window-size=${w},${h}`, `--force-device-scale-factor=${dpr}`, 'about:blank'], { stdio: 'ignore' });
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -33,4 +34,8 @@ try {
   writeFileSync(out, Buffer.from(r.result.data, 'base64'));
   console.log(logs.slice(-15).join('\n'));
   ws.close();
-} finally { chrome.kill(); }
+} finally {
+  chrome.kill();
+  if (chrome.exitCode === null && chrome.signalCode === null) await new Promise((r) => chrome.once('exit', r));
+  rmSync(profile, { recursive: true, force: true });
+}

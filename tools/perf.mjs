@@ -5,7 +5,7 @@
 //   * engine.stats every 250 ms (gpuMs median, pixelRatio, buffer size, resolution changes)
 // and prints a summary. Kills only that Chrome. Needs the page to expose window.__engine and window.__ready (engine.html does).
 import { spawn } from 'node:child_process';
-import { mkdtempSync } from 'node:fs';
+import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -18,7 +18,7 @@ const PORT = 9343;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const chromeArgs = [
-  `--remote-debugging-port=${PORT}`, `--user-data-dir=${mkdtempSync(join(tmpdir(), 'perf-'))}`,
+  `--remote-debugging-port=${PORT}`, `--user-data-dir=${profile}`,
   '--enable-gpu', '--use-angle=metal', '--ignore-gpu-blocklist', '--hide-scrollbars', '--mute-audio',
   '--no-first-run', '--no-default-browser-check',
   // an off-screen / background window must keep rendering at full rate
@@ -28,6 +28,7 @@ const chromeArgs = [
 ];
 if (headed) chromeArgs.push('--window-position=-2400,0', `--window-size=${w},${+h + 28}`, '--app=about:blank');   // +28: the macOS title bar
 else chromeArgs.push('--headless=new', `--window-size=${w},${h}`, 'about:blank');
+const profile = mkdtempSync(join(tmpdir(), 'perf-'));   // removed again in finally (230 leftovers once filled the disk)
 const chrome = spawn('/Applications/Google Chrome.app/Contents/MacOS/Google Chrome', chromeArgs, { stdio: 'ignore' });
 
 const pct = (a, p) => a[Math.min(a.length - 1, Math.floor(a.length * p))];
@@ -79,4 +80,8 @@ try {
   console.log(`res changes     ${data.changes} during the sample   dropped steps ${data.dropped}`);
   if (logs.some((l) => /error|EXC/i.test(l))) console.log('console errors:\n' + logs.filter((l) => /error|EXC/i.test(l)).slice(-5).join('\n'));
   ws.close();
-} finally { chrome.kill(); }
+} finally {
+  chrome.kill();
+  if (chrome.exitCode === null && chrome.signalCode === null) await new Promise((r) => chrome.once('exit', r));
+  rmSync(profile, { recursive: true, force: true });
+}

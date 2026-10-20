@@ -2,9 +2,9 @@
 // Contact sheet without Python/PIL: writes a temporary HTML grid (3 across, 640x360 cells, filename captions) and screenshots it
 // with its own headless Chrome on port 9343 (do not run alongside tools/perf.mjs) -> <outDir>/sheet.png. Kills only that Chrome.
 import { spawn } from 'node:child_process';
-import { writeFileSync, mkdtempSync, mkdirSync } from 'node:fs';
+import { writeFileSync, mkdtempSync, rmSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, resolve, basename } from 'node:path';
+import { dirname, join, resolve, basename } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 const [outDir, ...imgs] = process.argv.slice(2);
@@ -24,8 +24,9 @@ const page = join(mkdtempSync(join(tmpdir(), 'sheet-')), 'sheet.html');
 writeFileSync(page, html);
 
 const PORT = 9343, sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const profile = mkdtempSync(join(tmpdir(), 'sheet-prof-'));   // removed again in finally (230 leftovers once filled the disk)
 const chrome = spawn('/Applications/Google Chrome.app/Contents/MacOS/Google Chrome', [
-  '--headless=new', `--remote-debugging-port=${PORT}`, `--user-data-dir=${mkdtempSync(join(tmpdir(), 'sheet-prof-'))}`,
+  '--headless=new', `--remote-debugging-port=${PORT}`, `--user-data-dir=${profile}`,
   '--hide-scrollbars', '--allow-file-access-from-files', `--window-size=${W},${H}`, 'about:blank'], { stdio: 'ignore' });
 try {
   let target;
@@ -49,4 +50,9 @@ try {
   writeFileSync(join(outDir, 'sheet.png'), Buffer.from(r.result.data, 'base64'));
   console.log(`${join(outDir, 'sheet.png')}  ${W}x${H}  ${imgs.length} images`);
   ws.close();
-} finally { chrome.kill(); }
+} finally {
+  chrome.kill();
+  if (chrome.exitCode === null && chrome.signalCode === null) await new Promise((r) => chrome.once('exit', r));
+  rmSync(profile, { recursive: true, force: true });
+  rmSync(dirname(page), { recursive: true, force: true });
+}
