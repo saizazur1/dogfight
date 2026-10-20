@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>UI bench: menu, HUD, sound</title>
+<link href="https://fonts.googleapis.com/css2?family=Rubik:wght@500;700;800&display=swap" rel="stylesheet">
+<style>
+  html,body{margin:0;height:100%;overflow:hidden;background:linear-gradient(#e8a15e 0%,#7a6a8a 38%,#2a3550 55%,#1b2230 100%);font-family:Rubik,system-ui,sans-serif;color:#fff}
+  #hud{position:fixed;inset:0;pointer-events:none}
+  #bar{position:fixed;left:8px;bottom:8px;display:flex;flex-wrap:wrap;gap:6px;z-index:30;max-width:96vw;font-size:12px}
+  #bar button{font:600 12px Rubik,system-ui,sans-serif;padding:6px 10px;border-radius:8px;border:0;background:rgba(0,0,0,.55);color:#fff;cursor:pointer}
+  #bar button.on{background:#ffb43a;color:#1a1205}
+  #rectOutline{position:fixed;border:1px dashed rgba(255,255,255,.25);pointer-events:none;display:none}
+</style>
+<script type="importmap">{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.186.0/build/three.module.js"}}</script>
+</head>
+<body>
+<div id="hud"></div><div id="rectOutline"></div>
+<div id="menu"></div>
+<div id="bar"></div>
+<script type="module">
+import * as THREE from 'three';
+import { createMenu } from './js/menu.js';
+import { createHud } from './js/hud.js';
+import { createSound } from './js/sound.js';
+import { quatFromEuler } from './js/jetspec.js';
+
+// Bench: ?mode=chase|cockpit shows the HUD with a fake jet; ?screen=start|pause|settings shows the menu; ?static=1 freezes the motion.
+const P = new URLSearchParams(location.search);
+const mode = P.get('mode'), screen = P.get('screen') || (mode ? 'none' : 'start');
+const log = [];   // read by tools: window.__bench.log
+const snd = createSound();
+const menu = createMenu(document.getElementById('menu'), {
+  onPlay: (p, s) => { log.push(['play', p.name, p.color, p.skill]); snd.start(); snd.setVolume(s.volume); menu.show('none'); },
+  onResume: () => { log.push('resume'); menu.show('none'); }, onQuit: () => log.push('quit'), onSettings: () => log.push('settings'),
+  onChange: (s) => { log.push(['change', JSON.stringify(s)]); snd.setVolume(s.volume); },
+});
+menu.show(screen);
+
+// ---- fake jet, camera and HUD
+const hud = createHud(document.getElementById('hud'));
+hud.setEnv({ terrainHeightAt: () => 2200 });
+const camera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 1, 1e5);
+const fake = { speed: 210, throttle: 0.75, ab: 0, gLoad: 1.4, brake: 0, crashed: false, warn: { pullUp: false, stall: false, boundary: false }, vel: [0, 0, 0] };
+const pose = { pos: [0, 3600, 0], q: [0, 0, 0, 1] }, aim = [0, 0, -1];
+const flipY = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), Math.PI);   // camera looks down -z, the jet's nose is +z
+const dir = (h, p) => [Math.sin(h) * Math.cos(p), Math.sin(p), -Math.cos(h) * Math.cos(p)];
+let view = mode === 'chase' ? 'chase' : 'cockpit', t0 = performance.now();
+let hudOn = !!mode, ladder = false;
+function frame(now) {
+  const t = P.has('static') ? 0 : (now - t0) / 1000, h = 0.7 + 0.15 * Math.sin(t * 0.3), p = 0.14 + 0.06 * Math.sin(t * 0.5), b = 0.45 * Math.sin(t * 0.4);
+  quatFromEuler(h, p, b, pose.q);
+  camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix();
+  camera.position.fromArray(pose.pos); camera.quaternion.fromArray(pose.q).multiply(flipY);
+  const v = dir(h + 0.02, p - 0.05); fake.vel[0] = v[0] * fake.speed; fake.vel[1] = v[1] * fake.speed; fake.vel[2] = v[2] * fake.speed;
+  const a = dir(h + 0.09, p + 0.05); aim[0] = a[0]; aim[1] = a[1]; aim[2] = a[2];
+  const W = innerWidth, H = innerHeight, rect = { x: W * 0.2, y: H * 0.1, w: W * 0.6, h: H * 0.58 };
+  const ro = document.getElementById('rectOutline');
+  if (hudOn && view === 'cockpit') { Object.assign(ro.style, { display: 'block', left: rect.x + 'px', top: rect.y + 'px', width: rect.w + 'px', height: rect.h + 'px' }); } else ro.style.display = 'none';
+  document.getElementById('hud').style.display = hudOn ? '' : 'none';
+  hud.setMode(view, view === 'cockpit' ? rect : undefined); hud.setLadder(ladder);
+  if (hudOn) hud.update(camera, pose, aim, fake);
+  snd.update(camera, fake, view);
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+// ---- buttons
+const bar = document.getElementById('bar');
+const btn = (label, fn, toggle) => { const b = document.createElement('button'); b.textContent = label; b.onclick = () => { const r = fn(); if (toggle) b.classList.toggle('on', !!r); }; bar.appendChild(b); return b; };
+btn('Start audio', () => { snd.start(); snd.setVolume(menu.settings.volume); log.push('audio-start'); });
+btn('Menu: start', () => menu.show('start')); btn('pause', () => menu.show('pause')); btn('none', () => menu.show('none'));
+btn('HUD', () => (hudOn = !hudOn), true).classList.toggle('on', hudOn);
+btn('View: ' + view, function () { view = view === 'chase' ? 'cockpit' : 'chase'; return 0; });
+btn('Ladder (chase)', () => (ladder = !ladder), true);
+btn('Afterburner', () => { fake.ab = fake.ab ? 0 : 1; return fake.ab; }, true);
+btn('Throttle 20/75/100', () => { fake.throttle = fake.throttle > 0.9 ? 0.2 : fake.throttle > 0.5 ? 1 : 0.75; return 0; });
+btn('Speed 90/210/330 m/s', () => { fake.speed = fake.speed < 120 ? 210 : fake.speed < 250 ? 330 : 90; return 0; });
+btn('PULL UP', () => (fake.warn.pullUp = !fake.warn.pullUp), true);
+btn('STALL', () => (fake.warn.stall = !fake.warn.stall), true);
+for (const n of ['launch', 'flare', 'pop', 'boom', 'bang', 'rocket', 'crack']) btn(n, () => { snd.oneShot(n); log.push('shot-' + n); });
+window.__bench = { log, snd, menu, hud, camera, setView(v) { view = v; }, status: () => snd.status() };
+</script>
+</body>
+</html>

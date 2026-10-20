@@ -7,6 +7,7 @@
 //   jet.setState(s /* JetState */, fit);     // surfaces, stick, throttle, pedals, nozzles, afterburner, brake, rails,
 //                                            // damage/fire -> the tail damage; fit = { seatAdjust }; allocation-free
 //   jet.anchors                              // Object3Ds named as jetspec ANCHORS, at ANCHORS within 1 cm (the harness checks)
+//   jet.paint(hex)                           // plain body colour (counter-shaded, under the panel texture); or buildJet(side, { body: hex })
 //   jet.canopy, jet.seat                     // children of group (canopy origin = CANOPY.hinge, seat origin = SEAT.ref, both
 //                                            // with the jet's axes); GLUE re-parents them to the scene at canopyOff / eject
 //   jet.buildMissile(kind)                   // 'short' (MISSILE) | 'medium'; origin at the body's centre, nose +z
@@ -387,12 +388,13 @@ function makeMaterials(liv) {
 /** counter-shading: upper surfaces darker, lower lighter, a soft blend on the sides (vertex colours from the normals) */
 function counterShade(g, upper, lower) {
     if (!g.attributes.normal) g.computeVertexNormals();
-    const n = g.attributes.normal, col = new Float32Array(n.count * 3), U = new THREE.Color(upper), L = new THREE.Color(lower), c = new THREE.Color();
+    const n = g.attributes.normal, old = g.attributes.color, reuse = old && old.array.length === n.count * 3;   // repaint: write in place
+    const col = reuse ? old.array : new Float32Array(n.count * 3), U = new THREE.Color(upper), L = new THREE.Color(lower), c = new THREE.Color();
     for (let i = 0; i < n.count; i++) {
         const t = clamp((n.getY(i) + 0.25) / 0.6, 0, 1), k = t * t * (3 - 2 * t);
         c.copy(L).lerp(U, k); col[i * 3] = c.r; col[i * 3 + 1] = c.g; col[i * 3 + 2] = c.b;
     }
-    g.setAttribute('color', new THREE.BufferAttribute(col, 3));
+    if (reuse) old.needsUpdate = true; else g.setAttribute('color', new THREE.BufferAttribute(col, 3));
     return g;
 }
 
@@ -1051,5 +1053,14 @@ export function buildJet(side = 0, opts = {}) {
             for (const mt of Array.isArray(o.material) ? o.material : o.material ? [o.material] : []) if (!seen.has(mt)) { seen.add(mt); mt.dispose(); }
         });
     }
-    return { group, canopy, seat, setState, anchors, surfaces, missiles, buildMissile: (kind) => buildMissile(kind, m), triangles: Math.round(triangles), side, livery: liv, dispose };
+    /** Body paint: one plain colour (hex) over the whole airframe, still counter-shaded (upper ~0.6x darker, lower a touch
+     *  lighter) and still under the panel-line / grime texture -- a tint, not a flat fill. Not per frame (rewrites vertex colours). */
+    function paint(hex) {
+        const base = new THREE.Color(hex), up = base.clone().multiplyScalar(0.6), low = base.clone().lerp(new THREE.Color('#ffffff'), 0.1);
+        const seen = new Set();
+        for (const root of [group, canopy]) root.traverse((o) => { if (o.material === m.paint && !seen.has(o.geometry)) { seen.add(o.geometry); counterShade(o.geometry, up, low); } });
+        liv.upper = '#' + up.getHexString(); liv.lower = '#' + low.getHexString();
+    }
+    if (opts.body) paint(opts.body);
+    return { group, canopy, seat, setState, paint, anchors, surfaces, missiles, buildMissile: (kind) => buildMissile(kind, m), triangles: Math.round(triangles), side, livery: liv, dispose };
 }

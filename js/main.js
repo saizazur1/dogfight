@@ -1,7 +1,8 @@
 /**
  * main.js — boots the game and glues the lanes together (README "Files and owners").
  *
- * Flow: loading screen → build engine, world and jet → warm up shaders → PLAY menu → fly.
+ * Flow: loading screen → build engine, world, jet and pilot → warm up shaders → start menu (menu.js) → fly.
+ * Views: V toggles the chase camera (chasecam.js) and the cockpit (cockpitcam.js); the HUD follows (hud.setMode).
  * Simulation: flight.stepJet at a fixed 120 Hz (engine.run); rendering interpolates between the last two steps.
  * A crash (the HUD shows CRASHED) waits 2 s, then respawns at world.spawn (a calm moment for the adaptive resolution).
  */
@@ -14,6 +15,10 @@ import { createJet, stepJet, jetModelState } from './flight.js';
 import { createControls } from './controls.js';
 import { createChaseCam } from './chasecam.js';
 import { createHud } from './hud.js';
+import { createCockpitCam } from './cockpitcam.js';
+import { buildPilot } from './pilot.js';
+import { createMenu } from './menu.js';
+import { createSound } from './sound.js';
 
 const $ = (id) => document.getElementById(id);
 const params = new URLSearchParams(location.search);
@@ -40,13 +45,22 @@ async function boot() {
 
   progress(0.7, 'Rolling out the jet…');
   const jet = buildJet(0, { screenLight: false });
+  const pilot = buildPilot(jet, {});
   world.applyEnv(jet.group, 1);
+  const glassSymbols = jet.group.getObjectByName('hud-symbols');   // the model's fake HUD picture: hidden while hud.js draws the real one
   scene.add(jet.group);
 
   const env = { terrainHeightAt: world.terrainHeightAt, playArea: world.playArea };
   const controls = createControls({ canvas: $('stage') });
   const cam = createChaseCam(camera); cam.setEnv(env);
   const hud = createHud($('hud')); hud.setEnv(env);
+  const cockpit = createCockpitCam(camera, { jet });
+  const sound = createSound();
+  let view = 'chase';
+  if (params.get('view') === 'cockpit') controls.view = 'cockpit';
+  // The model's HUD glass is only ~5% of the screen wide from the pilot's eye: the HUD is drawn over the glass's centre
+  // but at least this big, so it stays readable (a game HUD, not a to-scale one).
+  const HUD_MIN_W = 0.34, hudBox = { x: 0, y: 0, w: 0, h: 0 };
 
   // ---- state: the sim (s), the previous step (for interpolation) and the drawn pose
   let s;
@@ -94,9 +108,26 @@ async function boot() {
     controls.update(frameDt, s);
     placeJet(alpha);
     jet.group.visible = !s.crashed;
-    cam.update(frameDt, pose, controls.ctl.aim, s, controls.look);
+    pilot.update(modelState, controls.look);
+    if (controls.view !== view) {
+      view = controls.view;
+      if (view === 'cockpit') cockpit.enter([pilot.head, glassSymbols]); else { cockpit.exit(); cam.snap(); }
+    }
+    if (view === 'cockpit') cockpit.update(frameDt, pose, controls.look, s);
+    else cam.update(frameDt, pose, controls.ctl.aim, s, controls.look);
     world.update(t, camera);
+    hud.setMode(view, view === 'cockpit' ? hudRectFor() : undefined);
     hud.update(camera, pose, controls.ctl.aim, s);
+    sound.update(camera, s, view);
+  }
+
+  /** The cockpit HUD box: on the model's glass, grown (upward) to a readable size. */
+  function hudRectFor() {
+    const r = cockpit.hudRect(innerWidth, innerHeight);
+    if (!r) return undefined;
+    const w = Math.max(r.w, innerWidth * HUD_MIN_W), h = Math.max(r.h, w * 0.55);
+    hudBox.x = r.x + r.w / 2 - w / 2; hudBox.y = r.y + r.h - h; hudBox.w = w; hudBox.h = h;   // grows upward: never over the instrument panel
+    return hudBox;
   }
 
   spawn();
@@ -114,17 +145,35 @@ async function boot() {
   progress(1, 'Ready');
 
   $('loading').classList.add('hidden');
-  $('menu').classList.remove('hidden');
-  $('hud').classList.add('hidden');   // the menu sits over the live scene, without the flight HUD
+  const showHud = (on) => $('hud').classList.toggle('hidden', !on);   // the menu sits over the live scene, without the flight HUD
   const start = () => {
-    $('menu').classList.add('hidden'); $('hud').classList.remove('hidden'); playing = true;
+    menu.show('none'); showHud(true); playing = true;
     try { $('stage').requestPointerLock()?.catch?.(() => {}); } catch { /* lock refused: the canvas click retries */ }
   };
-  $('play').addEventListener('click', start);
-  if (params.has('autoplay')) start();
-  controls.onLockChange = (locked) => { if (!locked && playing && !params.has('autoplay')) { playing = false; $('menu').classList.remove('hidden'); $('hud').classList.add('hidden'); $('play').textContent = 'RESUME'; engine.calm(); } };
+  const applySettings = (st) => {
+    controls.setSensitivity(0.0018 * st.sensitivity);
+    controls.setInvertY(st.invertY);
+    sound.setVolume(st.volume);
+    world.setQuality(st.quality);
+    $('fps').classList.toggle('hidden', !st.showFps);
+  };
+  const menu = createMenu($('menu'), {
+    onPlay: (profile) => { jet.paint(profile.color); sound.start(); sound.pause(false); start(); },
+    onResume: () => { sound.pause(false); start(); },
+    onQuit: () => { playing = false; spawn(); showHud(false); menu.show('start'); },
+    onChange: applySettings,
+  });
+  applySettings(menu.settings);
+  engine.onPerf = (st) => { if (menu.settings.showFps) $('fps').textContent = `${Math.round(st.fps)} fps`; };
+  showHud(false);
+  menu.show('start');
+  if (params.has('autoplay')) { jet.paint(menu.profile.color); start(); }
+  controls.onLockChange = (locked) => {
+    if (locked || !playing || params.has('autoplay')) return;
+    playing = false; showHud(false); sound.pause(true); menu.show('pause'); engine.calm();
+  };
 
-  window.__game = { engine, world, jet, controls, get state() { return s; } };
+  window.__game = { engine, world, jet, pilot, controls, menu, sound, get state() { return s; } };
   window.__engine = engine; window.__ready = true;   // tools/perf.mjs reads these
   engine.run(step, frame);
 }

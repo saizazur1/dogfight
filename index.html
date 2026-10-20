@@ -18,9 +18,7 @@
   .sub { font-weight: 500; opacity: .8; font-size: 14px; }
   .bar { width: 260px; height: 6px; border-radius: 3px; background: rgba(255,255,255,.15); overflow: hidden; margin: 0 auto; }
   .bar > i { display: block; height: 100%; width: 0; background: var(--accent); transition: width .3s; }
-  button.play { font: 800 22px Rubik, system-ui, sans-serif; letter-spacing: .06em; color: #1a1205; background: var(--accent); border: 0; border-radius: 12px; padding: 14px 54px; cursor: pointer; }
-  button.play:hover { filter: brightness(1.08); }
-  .keys { font-size: 13px; opacity: .75; }
+  #fps { position: fixed; top: 8px; right: 10px; font: 700 13px Rubik, system-ui, sans-serif; color: rgba(255,255,255,.8); pointer-events: none; }
   .hidden { display: none !important; }
 </style>
 <script type="importmap">
@@ -45,14 +43,8 @@
   </div>
 </div>
 
-<div class="overlay hidden" id="menu">
-  <div class="card">
-    <div class="title">DOGFIGHT</div>
-    <div class="sub" style="margin:6px 0 18px">Fly low between the peaks</div>
-    <button class="play" id="play">PLAY</button>
-    <div class="keys" style="margin-top:16px">Mouse: aim · W/S: throttle · Shift: afterburner · A/D: roll · C: look around · V: view · Esc: pause</div>
-  </div>
-</div>
+<div id="menu"></div>
+<div id="fps" class="hidden"></div>
 
 <script type="module" src="js/main.js"></script>
 </body>

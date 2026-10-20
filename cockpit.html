@@ -1,0 +1,156 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cockpit Bench</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #0b1018; overflow: hidden; }
+  canvas { display: block; width: 100vw; height: 100vh; }
+  #msg { position: fixed; left: 50%; bottom: 70px; transform: translateX(-50%); color: #fff; opacity: .85;
+    font: 800 14px "Nunito", system-ui, sans-serif; letter-spacing: 1px; text-shadow: 0 1px 3px #000; text-align: center; }
+  #credit { position: fixed; right: 8px; bottom: 6px; color: #fff; opacity: .6; font: 11px system-ui, sans-serif; }
+  #hudrect { position: fixed; left: 0; top: 0; width: 100vw; height: 100vh; pointer-events: none; }
+</style>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.186.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.186.0/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<canvas id="c"></canvas>
+<svg id="hudrect"></svg>
+<div id="msg">loading...</div>
+<div id="credit"></div>
+<script type="module">
+// cockpit.html -- the COCKPIT lane's bench: the real world and jet, the generic pilot in the seat, the cockpit camera. Params:
+//   ?view=cockpit|chase    the starting view (V toggles)
+//   ?color=<hex>           the body paint (jet.paint), e.g. ?color=%23c8362c
+//   ?helmet=<hex>          the helmet colour
+//   ?look=yaw,pitch        deg, held (controls.look convention: + yaw = right, + pitch = up), e.g. ?look=-70,0 = look left
+//   ?view=inspect&cam=x,y,z   a fixed close lens at a jet-space point, aimed at the pilot (default 1.4,2.1,6.4)
+//   ?dist=<m>              chase distance (default the chase cam's own)
+//   ?hudrect=1             outline the HUD glass's screen rect (cockpit view)
+//   ?still=1               no simulation: the jet holds its spawn pose
+//   ?flat=1                a simple ground instead of jetworld.js
+import * as THREE from 'three';
+import { createJet, stepJet, jetModelState } from './js/flight.js';
+import { createControls } from './js/controls.js';
+import { createChaseCam, CAM } from './js/chasecam.js';
+import { createCockpitCam } from './js/cockpitcam.js';
+import { buildJet } from './js/jetmodel.js';
+import { buildPilot } from './js/pilot.js';
+import { poseMatrix, toWorld, ANCHORS } from './js/jetspec.js';
+
+const P = new URLSearchParams(location.search);
+const D2R = Math.PI / 180, DT = 1 / 120;
+const msg = document.getElementById('msg');
+const canvas = document.getElementById('c');
+
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: false, logarithmicDepthBuffer: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 1.5));
+renderer.setSize(innerWidth, innerHeight, false);
+renderer.toneMapping = THREE.AgXToneMapping;
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(68, innerWidth / innerHeight, 0.5, 4e5);
+addEventListener('resize', () => { renderer.setSize(innerWidth, innerHeight, false); camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix(); });
+
+// ---------------------------------------------------------------- the world (real, or ?flat=1)
+function flatWorld() {
+  const h = (x, z) => 600 + 900 * Math.max(0, Math.sin(x / 2300) * Math.cos(z / 2900)) ** 1.5;
+  const geo = new THREE.PlaneGeometry(40000, 40000, 200, 200); geo.rotateX(-Math.PI / 2);
+  const p = geo.attributes.position;
+  for (let i = 0; i < p.count; i++) p.setY(i, h(p.getX(i), p.getZ(i)));
+  geo.computeVertexNormals();
+  scene.add(new THREE.Mesh(geo, new THREE.MeshStandardMaterial({ color: 0x8a8f85, roughness: 1, flatShading: true })), new THREE.HemisphereLight(0xbfd8ff, 0x55504a, 1.2));
+  const sun = new THREE.DirectionalLight(0xffe2b8, 3); sun.position.set(-3, 1.2, 2); scene.add(sun);
+  scene.background = new THREE.Color(0x9cc3e6);
+  return { terrainHeightAt: h, exposure: 1, update() {}, applyEnv() {}, credit: null, spawn: { pos: [0, 2200, 0], heading: 0, speed: 220 } };
+}
+let world;
+if (P.get('flat') === '1') world = flatWorld();
+else {
+  try { const { buildJetWorld } = await import('./js/jetworld.js'); world = await buildJetWorld(scene, renderer, { seed: 7 }); }
+  catch (e) { console.warn('[cockpit] jetworld failed, using ?flat=1 ground:', e); world = flatWorld(); }
+}
+renderer.toneMappingExposure = world.exposure ?? 1;
+if (world.credit) document.getElementById('credit').textContent = world.credit;
+const env = { terrainHeightAt: world.terrainHeightAt, playArea: world.playArea ?? { cx: 0, cz: 0, half: 15000, ceiling: 6000 } };
+
+// ---------------------------------------------------------------- the jet and the pilot
+const jet = buildJet(0, { screenLight: false, body: P.get('color') || undefined });
+scene.add(jet.group);
+const pilot = buildPilot(jet, { helmetColor: P.get('helmet') || undefined });
+world.applyEnv?.(jet.group);
+
+// ---------------------------------------------------------------- flight, controls, cameras
+const controls = createControls({ canvas });
+const ctl = controls.ctl;
+const chase = createChaseCam(camera); chase.setEnv(env);
+if (P.get('dist')) { CAM.dist = +P.get('dist'); CAM.height = CAM.dist * 0.2; }
+const cock = createCockpitCam(camera, { jet });
+const sp = world.spawn ?? { pos: [0, 2200, 0], heading: 0, speed: 220 };
+let s = createJet({ pos: sp.pos.slice(), heading: sp.heading, speed: sp.speed ?? 220 });
+ctl.throttle = 0.8; controls.reset(sp.heading, 0);
+controls.view = P.get('view') === 'chase' || P.get('view') === 'inspect' ? 'chase' : 'cockpit';
+const INSPECT = P.get('view') === 'inspect' ? (P.get('cam') || '1.4,2.1,6.4').split(',').map(Number) : null;
+const STILL = P.get('still') === '1';   // no simulation: the jet holds its spawn pose (repeatable screenshots)
+const LOOK = P.get('look') ? P.get('look').split(',').map((v) => +v * D2R) : null;
+controls.onLockChange = (l) => { msg.textContent = l ? '' : 'click to fly  |  V view, C (hold) free look, W/S throttle'; };
+controls.onLockChange(false);
+if (P.has('view')) msg.style.display = 'none';   // clean screenshots
+
+const prev = { pos: s.pos.slice(), q: s.q.slice() };
+const pose = { pos: [0, 0, 0], q: [0, 0, 0, 1] }, qa = new THREE.Quaternion(), qb = new THREE.Quaternion(), ms = {}, mat = new Array(16);
+const svg = document.getElementById('hudrect'), showRect = P.get('hudrect') === '1';
+let acc = 0, last = performance.now(), simT = 0, view = null, logged = false;
+function frame(now) {
+  const fdt = Math.min((now - last) / 1000, 0.1); last = now;
+  controls.update(fdt, s);
+  if (LOOK) { controls.look.yaw = LOOK[0]; controls.look.pitch = LOOK[1] || 0; }
+  if (!STILL) acc += fdt;
+  while (acc >= DT) {
+    acc -= DT;
+    for (let j = 0; j < 3; j++) prev.pos[j] = s.pos[j];
+    for (let j = 0; j < 4; j++) prev.q[j] = s.q[j];
+    stepJet(s, ctl, DT, env); simT += DT;
+    if (s.crashed) { s = createJet({ pos: sp.pos.slice(), heading: sp.heading, speed: sp.speed ?? 220 }); controls.reset(sp.heading, 0); chase.snap(); }
+  }
+  const a = STILL ? 1 : acc / DT;
+  for (let j = 0; j < 3; j++) pose.pos[j] = prev.pos[j] + (s.pos[j] - prev.pos[j]) * a;
+  qa.fromArray(prev.q); qb.fromArray(s.q); qa.slerp(qb, a); qa.toArray(pose.q);
+  jet.group.matrix.fromArray(poseMatrix(pose.pos, pose.q, mat)); jet.group.matrixWorldNeedsUpdate = true;
+  jet.setState(jetModelState(s, ms));
+  pilot.update(ms, controls.look);
+
+  if (controls.view !== view) { view = controls.view; if (view === 'cockpit') cock.enter([pilot.head]); else { cock.exit(); chase.snap(); } }
+  if (view === 'cockpit') cock.update(fdt, pose, controls.look, s);
+  else if (INSPECT) {   // a close look at the pilot: the lens at a jet-space point, aimed at the eye, the jet's up
+    camera.near = 0.05; camera.fov = 50; camera.updateProjectionMatrix();
+    camera.position.fromArray(toWorld(pose, INSPECT)); camera.up.fromArray(toWorld({ pos: [0, 0, 0], q: pose.q }, [0, 1, 0]));
+    camera.lookAt(...toWorld(pose, [0, 1.0, 4.4])); camera.updateMatrixWorld();
+  } else chase.update(fdt, pose, ctl.aim, s, controls.look);
+  world.update(simT, camera);
+  renderer.render(scene, camera);
+
+  if (showRect) {
+    const r = view === 'cockpit' ? cock.hudRect(innerWidth, innerHeight) : null;
+    svg.innerHTML = r ? `<rect x="${r.x}" y="${r.y}" width="${r.w}" height="${r.h}" fill="none" stroke="#ff2bd6" stroke-width="1.5"/>`
+      + `<polygon points="${[0, 1, 3, 2].map((i) => r.pts[i * 2] + ',' + r.pts[i * 2 + 1]).join(' ')}" fill="none" stroke="#2bf0ff" stroke-width="1"/>` : '';
+  }
+  if (!logged && (simT > 0.5 || STILL)) {   // the world-position check: the pilot's eye vs the jet's eye anchor
+    logged = true;
+    const pe = pilot.eye.getWorldPosition(new THREE.Vector3()), je = new THREE.Vector3(...toWorld(pose, ANCHORS.eye));
+    const hm = pilot.head.getObjectByName('helmet'); hm.geometry.computeBoundingSphere(); const hp = hm.geometry.boundingSphere.center.clone().applyMatrix4(hm.matrixWorld);
+    console.log('[cockpit] pilot eye world', pe.toArray().map((v) => v.toFixed(3)).join(','), '| jet eye world', je.toArray().map((v) => v.toFixed(3)).join(','),
+      '| diff m', pe.distanceTo(je).toFixed(4), '| helmet centre world', hp.toArray().map((v) => v.toFixed(3)).join(','), '| helmet-jetEye', hp.clone().sub(je).toArray().map((v) => v.toFixed(3)).join(','), '| pilot tris', pilot.triangles, '| jet tris', jet.triangles);
+  }
+  requestAnimationFrame(frame);
+}
+window.__bench = { get s() { return s; }, ctl, controls, jet, pilot, cock, camera };
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
