@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hype bench</title>
+<!-- hype.html: lane HYPE's bench. Loads js/hype.js + js/cards.js alone over a fake sky with a fake HUD, a stub camera and a
+     logging fake sound, and plays scripted moments. bench.go('double') etc. (screenshots: tools/shot.mjs with evalJS
+     "await bench.go('double')"). "Real sound" switches to the game's sound.js so the new one-shots can be heard. -->
+<link href="https://fonts.googleapis.com/css2?family=Rubik:wght@500;700;800&display=swap" rel="stylesheet">
+<script type="importmap">{ "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.186.0/build/three.module.js" } }</script>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; font-family: Rubik, system-ui, sans-serif; color: #fff;
+    background: linear-gradient(#3d6fa8 0%, #8fb6d8 55%, #c9d6de 62%, #5a6470 63%, #3a4049 100%); }
+  #sky { position: fixed; inset: -40px; background:
+    radial-gradient(ellipse 30% 8% at 30% 30%, rgba(255,255,255,.7), transparent 70%),
+    radial-gradient(ellipse 22% 6% at 72% 22%, rgba(255,255,255,.6), transparent 70%),
+    linear-gradient(170deg, transparent 58%, #4b5562 58.3%, #39404a 100%); transform-origin: 50% 50%; }
+  .aim { position: fixed; left: 50%; top: 50%; width: 34px; height: 34px; margin: -17px; border: 2.5px solid rgba(255,255,255,.92); border-radius: 50%; }
+  .pill { position: fixed; background: rgba(8,12,18,.42); border-radius: 12px; padding: 5px 16px; font-weight: 800; letter-spacing: 2px; }
+  #bar { position: fixed; left: 8px; bottom: 8px; z-index: 30; display: flex; flex-wrap: wrap; gap: 4px; max-width: 70vw; }
+  #bar button { font: 700 12px Rubik, system-ui; border: 0; border-radius: 8px; padding: 6px 9px; background: rgba(255,255,255,.85); cursor: pointer; }
+  #log { position: fixed; left: 8px; bottom: 44px; z-index: 30; font: 12px ui-monospace, Menlo, monospace; background: rgba(0,0,0,.5); padding: 4px 8px; border-radius: 6px; white-space: pre; }
+</style>
+</head>
+<body>
+<div id="sky"></div>
+<div class="aim"></div>
+<div class="pill" style="left:50%;top:14px;transform:translateX(-50%)">YOU 1 – 0 VIPER</div>
+<div class="pill" style="left:20px;bottom:110px">HP ▮▮▮▮▮</div>
+<div id="log"></div>
+<div id="bar"></div>
+<script type="module">
+import { createHype } from './js/hype.js';
+import { createCards } from './js/cards.js';
+
+const log = document.getElementById('log'), sky = document.getElementById('sky');
+const heard = [];
+const fakeSound = { oneShot(kind) { heard.push(kind); if (heard.length > 6) heard.shift(); } };
+let sound = fakeSound;
+const proxy = { oneShot: (k, p) => sound.oneShot(k, p) };
+const hype = createHype(document.body, { sound: proxy });
+const cards = createCards(document.body);
+
+const F = (id, name, color) => ({ id, name, color, hp: 1, s: { pos: [id * 200, 0, 0], speed: 230, ab: 0, boost: 0, crashed: false } });
+const pool = [F(0, 'You', '#c8362c'), F(1, 'Viper', '#2b62cf'), F(2, 'Kestrel', '#e0a020'), F(3, 'Ghost', '#2a2d33'), F(4, 'Talon', '#3a9d5a'), F(5, 'Merlin', '#e7e7ea')];
+const me = pool[0];
+const ctx = { meId: 0, byId: (id) => pool[id] || null, me, modeId: 'chaos' };
+let t = 0, view = 'chase';
+const ev = (e) => { e.t = t; hype.onEvent(e, ctx); };
+const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// a stub camera: records what hype adds on top of a "placed" camera (rotations, offsets, fov)
+const cam = { fov: 68, rx: 0, ry: 0, rz: 0, tx: 0, ty: 0,
+  rotateX(a) { this.rx += a; }, rotateY(a) { this.ry += a; }, rotateZ(a) { this.rz += a; },
+  translateX(d) { this.tx += d; }, translateY(d) { this.ty += d; }, updateMatrixWorld() {}, updateProjectionMatrix() {} };
+let last = performance.now();
+function loop(now) {
+  const dt = Math.min(0.1, (now - last) / 1000); last = now; t += dt * hype.slowmo;
+  cam.fov = 68; cam.rx = cam.ry = cam.rz = cam.tx = cam.ty = 0;   // the chase cam rewrites the camera every frame
+  hype.frame(dt * hype.slowmo, cam, me, view);
+  const D = 180 / Math.PI;   // show the shake on the fake sky
+  sky.style.transform = `translate(${cam.ry * -900 + cam.tx * 20}px, ${cam.rx * 900 - cam.ty * 20}px) rotate(${cam.rz * D}deg) scale(${68 / cam.fov})`;
+  log.textContent = `t ${t.toFixed(1)}  slowmo ${hype.slowmo.toFixed(2)}  fov ${cam.fov.toFixed(1)}  shake yaw ${(cam.ry * D).toFixed(2)}° roll ${(cam.rz * D).toFixed(2)}°  view ${view}\nsound: ${heard.join(', ')}`;
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+const kill = (killer, victim, cause = 'missile') => ev({ type: 'kill', killer, victim, cause });
+const M = {
+  gun: async () => { for (let i = 0; i < 10; i++) { ev({ type: 'gunFired', owner: 0 }); ev({ type: 'gunHit', owner: 0, target: 1, pos: [200, 0, 0] }); await wait(45); } },
+  missile: async () => { ev({ type: 'missileHit', missile: 1, owner: 0, target: 1, pos: [200, 0, 0] }); },
+  kill: async () => { ev({ type: 'missileHit', missile: 1, owner: 0, target: 1, pos: [200, 0, 0] }); kill(0, 1); },
+  double: async () => { kill(0, 1, 'gun'); await wait(350); t += 1.5; kill(0, 2); },
+  streak: async () => { kill(0, 1); t += 6; kill(0, 2, 'gun'); t += 6; await wait(200); kill(0, 4); },
+  clutch: async () => { t += 10; me.hp = 0.18; kill(0, 2, 'gun'); me.hp = 1; },
+  revenge: async () => { kill(3, 0, 'gun'); await wait(500); t += 10; kill(0, 3); },
+  pickup: async () => { ev({ type: 'pickup', owner: 0, kind: 'shield', pos: [0, 0, 0] }); },
+  drop: async () => { ev({ type: 'dropIncoming', id: 9, pos: [0, 0, 0] }); },
+  hitme: async () => { ev({ type: 'missileHit', missile: 2, owner: 1, target: 0, pos: [0, 0, 0] }); },
+  shotdown: async () => { kill(2, 0); },
+  skill: async () => { kill(-1, 0, 'crash'); },
+  feed: async () => { kill(1, 2, 'gun'); kill(3, 4); kill(5, 5, 'crash'); kill(4, 3, 'gun'); kill(0, 5); },
+  burn: async () => { me.s.ab = 1; me.s.speed = 380; },
+  cruise: async () => { me.s.ab = 0; me.s.speed = 230; },
+  cockpit: async () => { view = view === 'chase' ? 'cockpit' : 'chase'; },
+  win: async () => { ev({ type: 'match', result: 'win', modeId: 'duel' }); cards.show('win', { text: 'YOU WIN', sub: '3 – 1 · Space: again · Esc: menu', ms: 0 }); },
+  lose: async () => { ev({ type: 'match', result: 'lose', modeId: 'duel' }); cards.show('lose', { text: 'YOU LOSE', sub: '1 – 3 · Space: again · Esc: menu', ms: 0 }); },
+  round: async () => { ev({ type: 'round', result: 'win' }); cards.show('roundWin', { text: 'ROUND WON' }); },
+  reset: async () => { hype.reset(); cards.hide(); me.s.ab = 0; me.s.speed = 230; view = 'chase'; },
+};
+const ALL = ['gun', 'missile', 'kill', 'double', 'streak', 'clutch', 'revenge', 'pickup', 'drop', 'hitme', 'shotdown', 'skill', 'burn', 'cruise', 'win'];
+window.bench = { hype, cards, ctx, go: (n) => M[n](), async all() { for (const n of ALL) { await M[n](); await wait(2200); } } };
+
+const bar = document.getElementById('bar');
+for (const n of [...Object.keys(M), 'all']) {
+  const b = document.createElement('button'); b.textContent = n; b.onclick = () => (n === 'all' ? window.bench.all() : M[n]()); bar.appendChild(b);
+}
+const rb = document.createElement('button'); rb.textContent = 'real sound'; bar.appendChild(rb);
+rb.onclick = async () => { const { createSound } = await import('./js/sound.js'); const s = createSound(); s.start(); sound = s; rb.textContent = 'sound: real'; };
+const voice = document.createElement('button'); voice.textContent = 'voice off'; bar.appendChild(voice);
+voice.onclick = () => { const on = voice.textContent === 'voice on'; hype.setVoice(on); voice.textContent = on ? 'voice off' : 'voice on'; };
+</script>
+</body>
+</html>

@@ -51,6 +51,7 @@ export function createSurvivalMode(game) {
 
   const mode = {
     id: 'survival', title: 'Survival',
+    powerups: { count: 4, dropEvery: 60 },
     get phase() { return phase; }, get wave() { return w; }, get kills() { return kills; },
     start() {
       w = 0; kills = 0; bannerKey = ''; wave.length = 0;

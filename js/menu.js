@@ -2,25 +2,29 @@
 // Style: one big PLAY button, white on translucent dark panels with backdrop blur, one accent (#ffb43a), the live 3D scene
 // visible behind. Everything is remembered in localStorage (try/catch: it works without it).
 //
-//   const menu = createMenu(rootDiv, { onPlay, onResume, onQuit, onSettings, onChange });
+//   const menu = createMenu(rootDiv, { onPlay, onResume, onQuit, onSettings, onChange, onLocker });
 //   menu.show('start' | 'pause' | 'none')
-//   menu.settings  { sensitivity (multiplier, 1 = default), invertY, volume (0..1), quality (0 low, 1 medium, 2 high), showFps }
-//   menu.profile   { name, color ('#rrggbb'), skill ('easy'|'medium'|'hard'), mode ('duel'|'survival'|'race'|'tutorial') }
+//   menu.settings  { sensitivity (multiplier, 1 = default), invertY, volume (0..1), quality (0 low, 1 medium, 2 high), showFps, voice }
+//   menu.profile   { name, color ('#rrggbb'), skill ('easy'|'medium'|'hard'), mode ('duel'|'survival'|'race'|'tutorial'|'chaos') }
 //                  mode is picked on the start screen; it defaults to 'tutorial' until localStorage['dogfight.tutorialDone'] is set
-//                  (then 'duel'), and is remembered once the player has chosen one. Skill only shows for duel / survival.
+//                  (then 'duel'), and is remembered once the player has chosen one. Skill only shows for duel / survival / chaos.
 //                  Saved bests shown on the cards: any localStorage key starting 'dogfight.raceBest' (seconds, or ms when >= 5000;
 //                  the lowest wins) and 'dogfight.survivalBest' (kills). They refresh every time the start screen is shown.
 //   menu.onChange = (settings) => {}      // also fires for the options.onChange passed at creation; every settings edit
 //   menu.screen    // 'start' | 'pause' | 'none' (what is showing; the settings panel counts as its parent screen)
 // Enter plays (start) / resumes (pause); Esc resumes (pause) or goes back (settings). Real inputs underneath: Tab, arrows, Space work.
+// Lane UNLOCKS (README "Hooks contract"): settings.voice (announcer, default on); a side card on the start screen with level, rank,
+// XP bar, a LOCKER button (opts.onLocker) and today's 3 challenges, read from localStorage 'dogfight.progress.v1' through
+// progress.js (read-only here: the game's own instance is the one that saves) each time the start screen shows.
 
 const KEY = 'dogfight.menu.v1';
 const COLORS = [['#c8362c', 'Red'], ['#2b62cf', 'Blue'], ['#e0a020', 'Amber'], ['#3a9d5a', 'Green'], ['#8a4fd0', 'Violet'], ['#e7e7ea', 'White'], ['#2a2d33', 'Black'], ['#e0663a', 'Orange']];
 const SKILLS = [['easy', 'Easy'], ['medium', 'Medium'], ['hard', 'Hard']];
 const QUALITY = [['0', 'Low'], ['1', 'Medium'], ['2', 'High']];
-const MODES = [['duel', 'Duel', 'vs AI · best of 3'], ['survival', 'Survival', 'endless waves'], ['race', 'Ring race', 'fly the rings'], ['tutorial', 'First flight', 'learn the controls']];
+const MODES = [['duel', 'Duel', 'vs AI · best of 3'], ['chaos', 'Chaos', '2-min free-for-all'], ['survival', 'Survival', 'endless waves'], ['race', 'Ring race', 'fly the rings'], ['tutorial', 'First flight', 'learn the controls']];
+const SKILL_MODES = ['duel', 'survival', 'chaos'];
 const NAMES = ['Falcon', 'Viper', 'Raven', 'Condor', 'Maverick', 'Comet', 'Ghost', 'Hawk', 'Eagle', 'Storm', 'Phantom', 'Blaze'];
-const DEFAULTS = { settings: { sensitivity: 1, invertY: false, volume: 0.8, quality: 2, showFps: false }, profile: { name: '', color: COLORS[0][0], skill: 'medium' } };
+const DEFAULTS = { settings: { sensitivity: 1, invertY: false, volume: 0.8, quality: 2, showFps: false, voice: true }, profile: { name: '', color: COLORS[0][0], skill: 'medium' } };
 
 const CSS = `
 .dfm{position:fixed;inset:0;z-index:20;display:flex;align-items:center;justify-content:center;font-family:Rubik,system-ui,sans-serif;color:#fff;
@@ -59,7 +63,7 @@ const CSS = `
 .dfm .big:focus-visible,.dfm .lnk:focus-visible,.dfm .sec:focus-visible,.dfm .tg:focus-visible{outline:3px solid #fff;outline-offset:3px}
 .dfm .sec{width:100%;font-weight:700;font-size:17px;color:#fff;background:rgba(255,255,255,.14);border-radius:12px;padding:12px 0}
 .dfm .sec:hover{background:rgba(255,255,255,.22)}
-.dfm .keys{white-space:nowrap;font-size:13px;opacity:.8;text-align:center;line-height:1.4;text-shadow:0 1px 6px rgba(0,0,0,.6)}
+.dfm .keys{text-wrap:balance;font-size:13px;opacity:.8;text-align:center;line-height:1.4;text-shadow:0 1px 6px rgba(0,0,0,.6)}
 .dfm .lnk{background:none;color:#fff;opacity:.75;font-weight:500;font-size:14px;text-decoration:underline;padding:6px 10px;border-radius:8px}
 .dfm .lnk:hover{opacity:1}
 .dfm .row{display:flex;align-items:center;justify-content:space-between;gap:16px;min-height:38px}
@@ -73,7 +77,7 @@ const CSS = `
 .dfm .tg:after{content:"";position:absolute;left:3px;top:3px;width:24px;height:24px;border-radius:50%;background:#fff;transition:transform .15s}
 .dfm .tg[aria-checked=true]{background:#ffb43a}.dfm .tg[aria-checked=true]:after{transform:translateX(22px)}
 .dfm .rseg{width:210px}
-.dfm .modes{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}
+.dfm .modes{display:grid;grid-template-columns:repeat(5,1fr);gap:8px}
 .dfm .modes label{position:relative;cursor:pointer;display:flex}
 .dfm .modes input{position:absolute;inset:0;opacity:0;margin:0;cursor:pointer}
 .dfm .modes span{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px;text-align:center;padding:9px 4px;border-radius:12px;
@@ -87,6 +91,30 @@ const CSS = `
 .dfm .modes input:focus-visible+span{outline:3px solid #fff;outline-offset:1px}
 .dfm .modes i{position:absolute;right:-3px;top:-9px;font-style:normal;font-weight:800;font-size:10px;letter-spacing:.04em;white-space:nowrap;color:#1a1205;background:#fff;
   border-radius:8px;padding:2px 7px;box-shadow:0 2px 8px rgba(0,0,0,.4);pointer-events:none;z-index:1}
+.dfm .modes i.nw{background:#ff4d8a;color:#fff}
+.dfm .scr[data-s=start]{position:relative}
+.dfm .side{position:absolute;left:calc(100% + 18px);top:var(--sideTop,120px);width:236px;display:flex;flex-direction:column;gap:12px}
+.dfm .side .pnl{padding:16px 18px;gap:10px;border-radius:18px}
+.dfm .rk{display:flex;align-items:center;gap:12px}
+.dfm .lvb{flex:none;width:50px;height:50px;border-radius:50%;background:#ffb43a;color:#1a1205;display:flex;flex-direction:column;align-items:center;justify-content:center;
+  box-shadow:0 0 0 3px rgba(255,180,58,.3),0 4px 14px rgba(0,0,0,.35);line-height:1}
+.dfm .lvb small{font-weight:800;font-size:9px;letter-spacing:.12em}.dfm .lvb b{font-weight:800;font-size:21px}
+.dfm .rkn{flex:1;min-width:0;display:flex;flex-direction:column;gap:5px}
+.dfm .rkn b{font-weight:800;font-size:17px;letter-spacing:.04em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.dfm .xpb{height:8px;border-radius:4px;background:rgba(255,255,255,.18);overflow:hidden}.dfm .xpb i{display:block;height:100%;border-radius:4px;background:linear-gradient(90deg,#ffb43a,#ffd98a)}
+.dfm .rkn small{font-weight:600;font-size:11px;opacity:.7;font-variant-numeric:tabular-nums}
+.dfm .lk{width:100%;font-weight:800;font-size:15px;letter-spacing:.12em;color:#fff;background:rgba(255,255,255,.12);border-radius:12px;padding:10px 0;
+  box-shadow:inset 0 0 0 2px #ffb43a;transition:background .12s}
+.dfm .lk:hover{background:rgba(255,180,58,.22)}.dfm .lk:focus-visible{outline:3px solid #fff;outline-offset:3px}
+.dfm .eq{font-weight:600;font-size:11px;opacity:.7;text-align:center;margin-top:-3px}
+.dfm .dl{display:flex;flex-direction:column;gap:9px}
+.dfm .ch{display:flex;flex-direction:column;gap:4px}
+.dfm .ch div{display:flex;justify-content:space-between;gap:8px;font-weight:600;font-size:13px;line-height:1.2}
+.dfm .ch div span:last-child{flex:none;font-weight:700;font-size:11px;color:#ffb43a;font-variant-numeric:tabular-nums}
+.dfm .ch .xpb{height:5px}
+.dfm .ch.done div span:first-child{opacity:.6;text-decoration:line-through}.dfm .ch.done .xpb i{background:#5bd68f}
+@media (max-width:1099px){.dfm .side{position:static;width:100%;flex-direction:row;gap:12px}.dfm .side .pnl{flex:1}}
+@media (max-width:640px){.dfm .side{flex-direction:column}}
 .dfm [hidden]{display:none!important}
 @media (max-height:800px){.dfm .scr{gap:10px;padding:10px 0}.dfm h1{font-size:54px}.dfm .pnl{padding:16px 22px;gap:11px}.dfm .lbl{margin-bottom:5px}.dfm .big{font-size:26px;padding:12px 0}
   .dfm input[type=text]{padding:8px 12px}.dfm .sw label{width:34px;height:34px}.dfm .seg span{padding:7px 0}.dfm .modes span{padding:7px 4px}}
@@ -97,7 +125,7 @@ const CSS = `
   .dfm .keys{display:none}.dfm .lnk{padding:2px 10px;font-size:13px}}
 `;
 
-/** @param {HTMLElement} root @param {{onPlay?:Function,onResume?:Function,onQuit?:Function,onSettings?:Function,onChange?:Function}} [opts] */
+/** @param {HTMLElement} root @param {{onPlay?:Function,onResume?:Function,onQuit?:Function,onSettings?:Function,onChange?:Function,onLocker?:Function}} [opts] */
 export function createMenu(root, opts = {}) {
   // ---- saved state (defaults when storage is missing / broken)
   let saved = {};
@@ -124,10 +152,19 @@ export function createMenu(root, opts = {}) {
     <div class="pnl">
       <div><div class="lbl">Your name</div><input type="text" id="dfm-name" maxlength="16" autocomplete="off" spellcheck="false" value=""></div>
       <div><div class="lbl">Jet colour</div>${radios('color', COLORS, profile.color, 'sw')}</div>
-      <div><div class="lbl">Mode</div><div class="modes">${MODES.map(([v, t, d]) => `<label><input type="radio" name="mode" value="${v}" aria-label="${t}"><span><b>${t}</b><small>${d}</small><em data-best="${v}" hidden></em></span>${v === 'tutorial' ? '<i data-new hidden>New? Start here</i>' : ''}</label>`).join('')}</div></div>
+      <div><div class="lbl">Mode</div><div class="modes">${MODES.map(([v, t, d]) => `<label><input type="radio" name="mode" value="${v}" aria-label="${t}"><span><b>${t}</b><small>${d}</small><em data-best="${v}" hidden></em></span>${v === 'tutorial' ? '<i data-new hidden>New? Start here</i>' : v === 'chaos' ? '<i class="nw">NEW</i>' : ''}</label>`).join('')}</div></div>
       <div data-skill><div class="lbl">AI skill</div>${radios('skill', SKILLS, profile.skill, 'seg')}</div>
       <button class="big" data-a="play">PLAY</button>
       <div class="keys">Mouse aim · Click gun · Right-click / Space missile · F flares · W/S throttle · Shift afterburner · V view</div>
+    </div>
+    <div class="side" data-prog hidden>
+      <div class="pnl">
+        <div class="rk"><div class="lvb"><small>LVL</small><b data-p="level">1</b></div>
+          <div class="rkn"><b data-p="rank">Rookie</b><div class="xpb"><i data-p="bar" style="width:0%"></i></div><small data-p="xp"></small></div></div>
+        <button class="lk" data-a="locker">LOCKER</button>
+        <div class="eq" data-p="eq"></div>
+      </div>
+      <div class="pnl"><div class="lbl" style="margin:0">Daily challenges</div><div class="dl" data-p="daily"></div></div>
     </div>
     <button class="lnk" data-a="settings">Settings</button>
   </section>
@@ -143,6 +180,7 @@ export function createMenu(root, opts = {}) {
       <div class="row"><span>Volume</span><input type="range" min="0" max="1" step="0.05" data-k="volume" aria-label="Volume"><b class="val" data-v="volume"></b></div>
       <div class="row"><span>Graphics</span>${radios('quality', QUALITY, settings.quality, 'seg rseg')}</div>
       <div class="row"><span>Show FPS</span><button class="tg" role="switch" data-k="showFps" aria-label="Show FPS"></button></div>
+      <div class="row"><span>Announcer voice</span><button class="tg" role="switch" data-k="voice" aria-label="Announcer voice"></button></div>
       <button class="big" data-a="back" style="font-size:22px;padding:12px 0">BACK</button>
     </div>
   </section>`;
@@ -167,11 +205,33 @@ export function createMenu(root, opts = {}) {
   /** pushes mode-dependent bits: the radio, the skill row, the "New?" tag and the saved bests */
   function syncMode() {
     const r = root.querySelector(`input[name=mode][value=${profile.mode}]`); if (r) r.checked = true;
-    skillEl.hidden = profile.mode !== 'duel' && profile.mode !== 'survival';
+    skillEl.hidden = !SKILL_MODES.includes(profile.mode);
     newTag.hidden = tutDone();
     const rb = raceBest(), sb = Math.floor(Number(ls('dogfight.survivalBest')) || 0);
     const set = (k, t) => { const e = $(`[data-best=${k}]`); e.hidden = !t; if (e.textContent !== t) e.textContent = t; };
     set('race', rb ? `Best ${fmtTime(rb)}` : ''); set('survival', sb ? `Best ${sb} kill${sb === 1 ? '' : 's'}` : '');
+  }
+
+  // ---- the progress card (lane UNLOCKS): progress.js loads lazily; a broken / missing file just leaves the card hidden
+  let P = null;
+  const progEl = $('[data-prog]'), pv = (k) => progEl.querySelector(`[data-p=${k}]`);
+  const roStore = { getItem: (k) => ls(k), setItem() { /* read-only: the game's instance saves */ } };
+  import('./progress.js').then((m) => { P = m; if (menu.screen === 'start') syncProgress(); }).catch((e) => console.warn('menu: progress.js', e));
+  const esc = (t) => String(t).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+  /** level badge, rank, XP bar, equipped items and today's challenges, fresh from storage */
+  function syncProgress() {
+    if (!P) return;
+    try {
+      const st = P.createProgress(roStore).state, li = P.levelInfo(st.xp), name = (kind, id) => P.ITEMS.find((i) => i.kind === kind && i.id === id)?.name || id;
+      pv('level').textContent = st.level; pv('rank').textContent = st.rank;
+      pv('bar').style.width = `${Math.round(li.frac * 100)}%`;
+      pv('xp').textContent = `${li.into} / ${li.need} XP`;
+      pv('eq').textContent = `${st.equipped.trail === 'none' ? 'No trail' : `${name('trail', st.equipped.trail)} trail`} · ${name('finish', st.equipped.finish)} finish`;
+      pv('daily').innerHTML = st.daily.list.map((c) => `<div class="ch${c.done ? ' done' : ''}"><div><span>${esc(c.text)}</span><span>${c.done ? '✓' : `${c.n | 0}/${c.goal | 0}`} · +${c.xp | 0}</span></div><div class="xpb"><i style="width:${Math.round((100 * (c.n | 0)) / Math.max(1, c.goal | 0))}%"></i></div></div>`).join('');
+      progEl.hidden = false;
+      const pnl = screens.start.querySelector('.pnl');   // line the side card up with the main panel's top
+      if (pnl) screens.start.style.setProperty('--sideTop', `${pnl.offsetTop}px`);
+    } catch (e) { console.warn('menu: progress card', e); progEl.hidden = true; }
   }
 
   const menu = { settings, profile, screen: 'none', onChange: opts.onChange || null, show, el: root };
@@ -188,7 +248,7 @@ export function createMenu(root, opts = {}) {
     const target = which === 'settings' ? 'settings' : which;
     for (const k in screens) screens[k].classList.toggle('on', k === target);
     root.hidden = which === 'none';
-    if (which === 'start') { if (!chosen) profile.mode = tutDone() ? 'duel' : 'tutorial'; syncMode(); }
+    if (which === 'start') { if (!chosen) profile.mode = tutDone() ? 'duel' : 'tutorial'; syncMode(); syncProgress(); }
     if (which === 'start' || which === 'pause') { menu.screen = which; from = which; }
     else if (which === 'none') menu.screen = 'none';
     if (which !== 'none') { const b = screens[target].querySelector(target === 'settings' ? '[data-a=back]' : '.big'); if (b) b.focus({ preventScroll: true }); }
@@ -200,6 +260,7 @@ export function createMenu(root, opts = {}) {
     quit() { show('start'); if (opts.onQuit) opts.onQuit(); },
     settings() { show('settings'); if (opts.onSettings) opts.onSettings(); },
     back() { show(from); },
+    locker() { if (opts.onLocker) opts.onLocker(); },
   };
   root.addEventListener('click', (e) => { const b = e.target.closest('[data-a]'); if (b) act[b.dataset.a](); const t = e.target.closest('.tg'); if (t) { settings[t.dataset.k] = !settings[t.dataset.k]; sync(); fire(); } });
   root.addEventListener('input', (e) => {
@@ -214,7 +275,7 @@ export function createMenu(root, opts = {}) {
     else if (t.name === 'quality') { settings.quality = +t.value; fire(); }
   });
   addEventListener('keydown', (e) => {
-    if (root.hidden || e.repeat) return;
+    if (root.hidden || e.repeat || document.querySelector('.dfl:not([hidden])')) return;   // the locker (z above) owns the keys while open
     const scr = root.querySelector('.scr.on').dataset.s, tag = e.target.tagName;
     if (e.code === 'Escape') { if (scr === 'settings') act.back(); else if (scr === 'pause') act.resume(); }
     else if ((e.code === 'Enter' || e.code === 'NumpadEnter') && tag !== 'BUTTON') { if (scr === 'start') act.play(); else if (scr === 'pause') act.resume(); else if (scr === 'settings') act.back(); }

@@ -8,6 +8,7 @@
 //                                            // damage/fire -> the tail damage; fit = { seatAdjust }; allocation-free
 //   jet.anchors                              // Object3Ds named as jetspec ANCHORS, at ANCHORS within 1 cm (the harness checks)
 //   jet.paint(hex)                           // plain body colour (counter-shaded, under the panel texture); or buildJet(side, { body: hex })
+//   jet.finish(id)                           // 'gloss' (as built) | 'matte' | 'pearl' | 'chrome' | 'neon' | 'gold': this jet's paint material only
 //   jet.canopy, jet.seat                     // children of group (canopy origin = CANOPY.hinge, seat origin = SEAT.ref, both
 //                                            // with the jet's axes); GLUE re-parents them to the scene at canopyOff / eject
 //   jet.buildMissile(kind)                   // 'short' (MISSILE) | 'medium'; origin at the body's centre, nose +z
@@ -1055,12 +1056,46 @@ export function buildJet(side = 0, opts = {}) {
     }
     /** Body paint: one plain colour (hex) over the whole airframe, still counter-shaded (upper ~0.6x darker, lower a touch
      *  lighter) and still under the panel-line / grime texture -- a tint, not a flat fill. Not per frame (rewrites vertex colours). */
+    let bodyHex = null, finishId = 'gloss', gloss = null;
     function paint(hex) {
+        bodyHex = hex;
+        if (finishId === 'gold') { applyFinish(); return; }   // gold keeps its own colour; the body colour returns with the next finish
+        recolour(hex);
+    }
+    function recolour(hex) {
         const base = new THREE.Color(hex), up = base.clone().multiplyScalar(0.6), low = base.clone().lerp(new THREE.Color('#ffffff'), 0.1);
         const seen = new Set();
         for (const root of [group, canopy]) root.traverse((o) => { if (o.material === m.paint && !seen.has(o.geometry)) { seen.add(o.geometry); counterShade(o.geometry, up, low); } });
         liv.upper = '#' + up.getHexString(); liv.lower = '#' + low.getHexString();
     }
+    /** Paint finish (lane UNLOCKS, README "Hooks contract"): only THIS jet's paint material (makeMaterials is per jet, nothing
+     *  shared). 'gloss' = the look as built (values captured on the first call, after world.applyEnv). Uniforms only, so no
+     *  shader recompile; 'gold' also rewrites the vertex colours (like paint). Not per frame. Unknown ids fall back to gloss. */
+    const FINISHES = {
+        gloss: null,
+        matte: { roughness: 1.0, metalness: 0.0, env: 0.35, tint: 1 },
+        pearl: { roughness: 0.3, metalness: 0.3, env: 1.5, tint: 1.18, emissive: '#d8d0ff', ei: 0.035 },
+        chrome: { roughness: 0.12, metalness: 1.0, env: 1.9, tint: 1.5 },
+        neon: { roughness: 0.45, metalness: 0.1, env: 0.8, tint: 1, emissive: 'body', ei: 0.9 },
+        gold: { roughness: 0.28, metalness: 0.85, env: 1.6, tint: 1.4, body: '#e0ad45', emissive: '#ffb43a', ei: 0.06 },
+    };
+    function finish(id) {
+        const p = m.paint;
+        if (!gloss) gloss = { roughness: p.roughness, metalness: p.metalness, env: p.envMapIntensity, color: p.color.clone(), emissive: p.emissive.clone(), ei: p.emissiveIntensity };
+        const wasGold = finishId === 'gold';
+        finishId = Object.prototype.hasOwnProperty.call(FINISHES, id) ? id : 'gloss';
+        applyFinish();
+        if (wasGold && finishId !== 'gold' && bodyHex) recolour(bodyHex);
+    }
+    function applyFinish() {
+        const p = m.paint, f = FINISHES[finishId];
+        if (!gloss) return;
+        if (!f) { p.roughness = gloss.roughness; p.metalness = gloss.metalness; p.envMapIntensity = gloss.env; p.color.copy(gloss.color); p.emissive.copy(gloss.emissive); p.emissiveIntensity = gloss.ei; return; }
+        p.roughness = f.roughness; p.metalness = f.metalness; p.envMapIntensity = gloss.env * f.env;
+        p.color.copy(gloss.color).multiplyScalar(f.tint);
+        if (f.emissive) { p.emissive.set(f.emissive === 'body' ? (bodyHex || '#ffffff') : f.emissive); p.emissiveIntensity = f.ei; } else { p.emissive.copy(gloss.emissive); p.emissiveIntensity = gloss.ei; }
+        if (f.body) recolour(f.body);
+    }
     if (opts.body) paint(opts.body);
-    return { group, canopy, seat, setState, paint, anchors, surfaces, missiles, buildMissile: (kind) => buildMissile(kind, m), triangles: Math.round(triangles), side, livery: liv, dispose };
+    return { group, canopy, seat, setState, paint, finish, anchors, surfaces, missiles, buildMissile: (kind) => buildMissile(kind, m), triangles: Math.round(triangles), side, livery: liv, dispose };
 }

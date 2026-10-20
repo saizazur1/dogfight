@@ -60,6 +60,9 @@ export const TUNE = {
   vTrans: 265,
   brakeRate: 2.0,        // air brake travel per second
   vMaxHard: 420,         // a hard clamp (a vertical dive in AB)
+  // --- boost (a power-up: powerups.js sets s.boost = s left and counts it down)
+  boostThrust: 1.6,      // thrust times this while s.boost > 0
+  boostTrans: 0.45,      // the transonic drag rise times this: level top speed ~300 -> ~335 m/s (a noticeable surge)
   // --- stall (Easy)
   vStall: 110,           // below this the jet is stalled (warn.stall)
   stallBand: 18,         // the stall fades in over vStall + 8 .. vStall - stallBand + 8
@@ -94,6 +97,7 @@ const PROBES = [[0, 0, JET.noseZ], [0, -0.3, JET.tailZ], [0, -1.0, 0], JET.wingt
  * @property {number[]} steer   [3] the direction the jet actually steers to (ctl.aim after the boundary / ceiling blend)
  * @property {number[]} up      [3] the lift direction (body +y before the AoA tilt)
  * @property {number} t         s since createJet
+ * @property {number} boost     s of power-up boost left (powerups.js writes it): more thrust, less transonic drag
  */
 
 /**
@@ -106,7 +110,7 @@ export function createJet({ pos, heading = 0, speed = 220 }) {
   const s = {
     pos: [pos[0], pos[1], pos[2]], vel: [fx * speed, 0, fz * speed], q: [0, 0, 0, 1], up: [0, 1, 0], steer: [fx, 0, fz],
     speed, throttle: 0.7, ab: 0, aoa: 0, gLoad: 1, rollRate: 0, stall: 0, brake: 0, yaw: 0, stickX: 0, stickY: 0,
-    crashed: false, crashPoint: null, warn: { pullUp: false, stall: false, boundary: false }, t: 0, _pullUpT: 0, _back: 0,
+    crashed: false, crashPoint: null, warn: { pullUp: false, stall: false, boundary: false }, t: 0, _pullUpT: 0, _back: 0, boost: 0,
   };
   orient(s);
   return s;
@@ -132,7 +136,7 @@ function rotAbout(v, k, a) {
 const nEff = (n) => 1 + (n - 1) * TUNE.turnBoost;
 const nLift = (v) => Math.min(TUNE.nMax, TUNE.nMax * (v / TUNE.vCorner) ** 2);
 const thrustOf = (thr) => (thr < AB_DETENT ? TUNE.thrDry * thr / AB_DETENT : TUNE.thrDry + (TUNE.thrAb - TUNE.thrDry) * (thr - AB_DETENT) / (1 - AB_DETENT));
-const dragOf = (v, n, brake) => (TUNE.d0 + TUNE.dBrake * brake) * (v / 250) ** 2 + TUNE.di * n * n * (250 / v) ** 2 + TUNE.dTrans * Math.max(0, v - TUNE.vTrans) ** 2;
+const dragOf = (v, n, brake, trans = 1) => (TUNE.d0 + TUNE.dBrake * brake) * (v / 250) ** 2 + TUNE.di * n * n * (250 / v) ** 2 + TUNE.dTrans * trans * Math.max(0, v - TUNE.vTrans) ** 2;
 const aoaOf = (v, n) => clamp(TUNE.aoaMaxDeg * D2R * n / (TUNE.nMax * (v / TUNE.vCorner) ** 2), -6 * D2R, (TUNE.aoaMaxDeg + 4) * D2R);
 
 // q from the flight path, the lift direction, the AoA and the skid
@@ -264,7 +268,8 @@ export function stepJet(s, ctl, dt, env) {
   s.yaw += clamp(yawK - s.yaw, -3 * dt, 3 * dt);
 
   // --- the point mass: lift + side force + thrust - drag + gravity (+ the stall's nose drop)
-  const along = thrustOf(s.throttle) - dragOf(v, s.gLoad, s.brake);
+  const boost = s.boost > 0;
+  const along = thrustOf(s.throttle) * (boost ? T.boostThrust : 1) - dragOf(v, s.gLoad, s.brake, boost ? T.boostTrans : 1);
   const nG = nEff(s.gLoad) * G, side = s.yaw * T.yawG * G;
   // stall drop: turn the path toward the ground (the across-path part of "down")
   const drop = s.stall * T.stallDropRate * v;

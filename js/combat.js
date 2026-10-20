@@ -12,6 +12,8 @@
 // "maddog": it flies straight and takes the first enemy that crosses its narrow seeker cone. Flares: each one rolls, as it
 // ignites, against every missile chasing its owner (aspect and timing decide the odds, jetplan's seeker slide to the flare).
 // Gun: rounds with gravity, a segment-vs-sphere test against every other live fighter.
+// Shield (powerups.js sets fighter.shield, s left): a hit still lands (missileHit / gunHit, with shielded: true) but does no
+// damage, and a shieldHit {target, pos} event goes out (at most every shieldEvtGap s per fighter). Crashes still kill.
 
 import { mulberry32 } from './rng.js';
 import { ANCHORS, FLARE, G, qRot } from './jetspec.js';
@@ -46,6 +48,8 @@ export const TUNE = {
   muzzle: [0.55, 0.45, 5.0],            // jet space (+z fwd, +x left): the left side of the nose
   // --- kills
   creditTime: 10,                       // s: a crash is credited to whoever hurt or locked the victim this recently
+  // --- shield (powerups.js writes fighter.shield, s left): hits do no damage; a shieldHit event at most every shieldEvtGap s
+  shieldEvtGap: 0.1,
   // --- pools
   maxMissiles: 32, maxBullets: 256, maxFlares: 192,
 };
@@ -125,9 +129,13 @@ export function createCombat({ terrainHeightAt, seed = 1, onEvent = null }) {
     }
     emit({ type: 'kill', killer, victim: f.id, cause });
   }
-  function damage(f, amount, killer, cause) {
+  function damage(f, amount, killer, cause, pos) {
     if (!f.alive) return;
     blame(f, killer);
+    if (f.shield > 0) {   // a power-up shield: no damage (the ground still kills: crashes never come through here)
+      if (t - f._c.shieldT >= T.shieldEvtGap - 1e-9) { f._c.shieldT = t; emit({ type: 'shieldHit', target: f.id, pos: [pos[0], pos[1], pos[2]] }); }
+      return;
+    }
     f.hp = Math.max(0, f.hp - amount);
     if (f.hp <= 1e-9) kill(f, killer, cause);
   }
@@ -328,8 +336,8 @@ export function createCombat({ terrainHeightAt, seed = 1, onEvent = null }) {
           if (SEG.d2 < T.mFuse * T.mFuse) {
             m.alive = false;
             for (let j = 0; j < 3; j++) S3[j] = S2[j] + (m.pos[j] - S2[j]) * u;
-            emit({ type: 'missileHit', missile: m.id, owner: m.owner, target: g.id, pos: [S3[0], S3[1], S3[2]] });
-            damage(g, T.mDamage, m.owner, 'missile');
+            emit({ type: 'missileHit', missile: m.id, owner: m.owner, target: g.id, pos: [S3[0], S3[1], S3[2]], shielded: g.shield > 0 });
+            damage(g, T.mDamage, m.owner, 'missile', S3);
           }
         }
         if (!m.alive) continue;
@@ -358,8 +366,8 @@ export function createCombat({ terrainHeightAt, seed = 1, onEvent = null }) {
         if (SEG.d2 < T.gunR * T.gunR) {
           b.alive = false;
           for (let j = 0; j < 3; j++) S3[j] = S2[j] + (b.pos[j] - S2[j]) * u;
-          emit({ type: 'gunHit', owner: b.owner, target: g.id, pos: [S3[0], S3[1], S3[2]] });
-          damage(g, T.gunDamage, b.owner, 'gun');
+          emit({ type: 'gunHit', owner: b.owner, target: g.id, pos: [S3[0], S3[1], S3[2]], shielded: g.shield > 0 });
+          damage(g, T.gunDamage, b.owner, 'gun', S3);
           break;
         }
       }
@@ -391,7 +399,7 @@ export function createCombat({ terrainHeightAt, seed = 1, onEvent = null }) {
     f.warn = f.warn || { missile: false, dir: [0, 0, 0], dist: 0 };
     f.warn.missile = false; f.warn.dist = 0; f.warn.dir[0] = f.warn.dir[1] = f.warn.dir[2] = 0;
     const c = f._c = f._c || {};
-    c.prevMissile = false; c.prevFlare = false; c.gunAcc = 1; c.gunEvtT = -1; c.burstLeft = 0; c.burstT = 0; c.flSide = 0; c.aggId = -1; c.aggT = -1e9;
+    c.prevMissile = false; c.prevFlare = false; c.gunAcc = 1; c.gunEvtT = -1; c.burstLeft = 0; c.burstT = 0; c.flSide = 0; c.aggId = -1; c.aggT = -1e9; c.shieldT = -1e9;
     for (const m of missiles) if (m.alive && (m.owner === f.id || m.target === f.id)) m.alive = false;
     for (const b of bullets) if (b.owner === f.id) b.alive = false;
     for (const fl of flares) if (fl.owner === f.id) fl.alive = false;

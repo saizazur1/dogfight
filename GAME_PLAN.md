@@ -27,6 +27,22 @@ You fly a jet low between snowy Karakoram peaks at sunset. First against an AI (
 | Time of day | Sunset by default, plus morning and noon. |
 | Server | Free hosting only (choice made in Phase 6). |
 
+## The "catchy" pass (2026-10-20)
+
+Owner's feedback after playing: "there's nothing catchy or brainrotting in this game that can grab my attention as Gen Z or Gen Alpha."
+Agreed to build all of these, before Phase 4:
+
+| Hook | What |
+|---|---|
+| Juice | Screen shake, hit tick sounds, "+100" pop-ups, slow motion on your kill, afterburner FOV kick and speed lines |
+| Hype announcer | DOUBLE / TRIPLE KILL, ON FIRE, UNSTOPPABLE, CLUTCH, REVENGE, SKILL ISSUE, big W / L cards, kill feed, a spoken voice (can be turned off) |
+| Unlocks | XP and levels after every match, ranks, 3 daily challenges, unlockable wingtip trails and paint finishes, a Locker |
+| Power-ups + supply drops | Floating pick-ups (repair, missiles, boost, shield) and a supply drop on a parachute; a few in duel and survival |
+| Chaos mode | 2-minute free-for-all, you + 7 AIs, back in 3 s, most kills wins, leaderboard |
+
+Tone: **hype but clean** (gamer slang, nothing rude). Only our own sounds and words, no real meme clips. Trails and finishes
+(gloss, matte, chrome, neon glow…) are allowed; still no insignia, flags, numbers or brands on the jets.
+
 ## Built "ready for online" from now on
 
 - Every jet, the player's included, is the same kind of object in one list. The AI and a remote player drive a jet the same way the mouse does: one set of controls per 120 Hz step.

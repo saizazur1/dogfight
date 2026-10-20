@@ -55,7 +55,7 @@ export async function createGame({ engine, world, menu, params, progress = () =>
   const BOT = params.has('bot');   // test only: an AI flies the player's jet too (robot play-tests, screenshots)
   const seed0 = +(params.get('seed') || 7);
 
-  const [createRaceMode, createTutorialMode, createRadar, createChaosMode, createHype, createProgress, createTrails, createLocker, createPowerups, createPowerupFx] = await Promise.all([
+  let [createRaceMode, createTutorialMode, createRadar, createChaosMode, createHype, createProgress, createTrails, createLocker, createPowerups, createPowerupFx] = await Promise.all([
     optional('./race.js', 'createRaceMode'), optional('./tutorial.js', 'createTutorialMode'), optional('./radar.js', 'createRadar'),
     optional('./chaos.js', 'createChaosMode'), optional('./hype.js', 'createHype'), optional('./progress.js', 'createProgress'),
     optional('./trails.js', 'createTrails'), optional('./locker.js', 'createLocker'), optional('./powerups.js', 'createPowerups'),
@@ -101,6 +101,7 @@ export async function createGame({ engine, world, menu, params, progress = () =>
   combat.add(me);
   // ---- hooks (README "Hooks contract"): each one optional; a hook that throws is switched off, the game goes on
   const hooks = {};
+  if (params.has('nohooks')) [createHype, createProgress, createTrails, createPowerups, createPowerupFx, createLocker] = [];   // test only: A/B the hooks' cost
   const hook = (name, fn) => { try { return fn(); } catch (e) { console.warn(`game: ${name} off`, e); hooks[name] = null; return undefined; } };
   hooks.hype = createHype && hook('hype', () => createHype(document.body, { sound }));
   hooks.prog = createProgress && hook('prog', () => createProgress());
@@ -154,7 +155,7 @@ export async function createGame({ engine, world, menu, params, progress = () =>
     f.jet.paint(f.color);
     f.target = null;
     place(f, { pos, heading, speed });
-    f.ai = createAI(f, { skill, env, combat, seed: ++seedN });
+    f.ai = createAI(f, { skill, env, combat, seed: ++seedN, pickups: game.powerups?.items });
     H('trails', (tr) => tr.set(f, 'vapor'));
     fighters.push(f);
     return f;
@@ -177,19 +178,19 @@ export async function createGame({ engine, world, menu, params, progress = () =>
   function respawnMe({ pos, heading, speed = SPAWN_SPEED }) {
     place(me, { pos, heading, speed });
     me.target = null;
-    if (BOT) me.ai = createAI(me, { skill: 'hard', env, combat, seed: ++seedN });
+    if (BOT) me.ai = createAI(me, { skill: 'hard', env, combat, seed: ++seedN, pickups: game.powerups?.items });
     controls.reset(heading, 0); controls.ctl.throttle = 0.84;
     cam.snap();
     engine.calm();
   }
 
   /**
-   * README: the i-th of n well-spread starts. Slots sit on a ring round the play area's middle, heading inward; each tries a
+   * README: the i-th of n well-spread starts (radius: the ring's, m; default grows with n). Slots sit on a ring round the play area's middle, heading inward; each tries a
    * few angles and headings and keeps the lowest start that clears every ground sample of the next 6 km by 600 m.
    * Deterministic (no random numbers). ponytail: straight-line sampling only, a ridge just off the path is not checked.
    */
-  function safeSpawn(i, n) {
-    const pa = world.playArea, r = Math.min(pa.half * 0.55, 2500 + 1200 * n), top = pa.ceiling - 300;
+  function safeSpawn(i, n, radius) {
+    const pa = world.playArea, r = radius || Math.min(pa.half * 0.55, 2500 + 1200 * n), top = pa.ceiling - 300;
     let best = null;
     for (const da of [0, -0.12, 0.12, -0.24, 0.24]) {
       const a = 0.7 + (2 * Math.PI * i) / Math.max(1, n) + da * (Math.PI / Math.max(2, n));
@@ -213,7 +214,7 @@ export async function createGame({ engine, world, menu, params, progress = () =>
     emit({ type: 'match', result: won === false ? 'lose' : won === null ? 'draw' : 'win', place, modeId });
     phase = 'finished';
     engine.timeScale = 1;
-    cards.show(won === false ? 'lose' : 'win', { text: title, sub: `${sub ? `${sub} · ` : ''}Space: again · Esc: menu`, ms: 0 });
+    cards.show(won === false ? 'lose' : 'win', { text: title, sub: `${sub ? `${sub} · ` : ''}Space: again · Esc: menu`, ms: 0, glyph: won === null ? '' : undefined });   // a draw: no W
     H('prog', (pr) => { const sum = pr.matchEnd({ modeId, won: won !== false && won !== null }); H('locker', (lk) => lk.showResult(sum)); });
     engine.setBusy(false); engine.calm();
   }
@@ -223,8 +224,10 @@ export async function createGame({ engine, world, menu, params, progress = () =>
   /** Every combat event: HUD, sound, effects; a shot-down jet is hidden (a burst unless it hit the ground); then the mode. */
   function onEvent(e) {
     hud.onEvent(e, me.id); sound.onEvent(e, me.id); wfx.onEvent(e);
-    H('hype', (hy) => hy.onEvent(e, hypeCtx));
-    if (phase === 'play') H('prog', (pr) => pr.onEvent(e, me.id, modeId));
+    if (!e.shielded) {   // a hit a shield stopped: no pop-up, no XP
+      H('hype', (hy) => hy.onEvent(e, hypeCtx));
+      if (phase === 'play') H('prog', (pr) => pr.onEvent(e, me.id, modeId));
+    }
     if (e.type === 'kill') {
       const victim = pool[e.victim];
       if (victim) { victim.jet.group.visible = false; if (e.cause !== 'crash') wfx.burst(victim.s.pos, victim.s.vel, 3); }
@@ -387,7 +390,7 @@ export async function createGame({ engine, world, menu, params, progress = () =>
     f.s = createJet({ pos: [me.s.pos[0] + Math.sin(h0) * 60 * k, me.s.pos[1] + 8 * k, me.s.pos[2] - Math.cos(h0) * 60 * k], heading: h0, speed: 200 });
     f.prev.pos = f.s.pos.slice(); f.prev.q = f.s.q.slice(); placeJet(f, 1); f.jet.group.visible = true;
   });
-  await engine.warmUp([0, 1, 2, 3].map((k) => look(k * Math.PI / 2, 0)).concat([look(0, -0.6), look(0, 0.5), () => { look(h0, 0)(); wfx.warmUp(camera); }]));
+  await engine.warmUp([0, 1, 2, 3].map((k) => look(k * Math.PI / 2, 0)).concat([look(0, -0.6), look(0, 0.5), () => { look(h0, 0)(); wfx.warmUp(camera); H('pfx', (px) => px.warmUp(camera)); }]));
   for (const f of pool) if (f !== me) f.jet.group.visible = false;
   respawnMe(world.spawn);
   progress(1, 'Ready');

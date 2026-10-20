@@ -6,6 +6,7 @@
 //   snd.update(camera, s, view);      // every display frame; view = 'chase' | 'cockpit'
 //   snd.setVolume(0..1);  snd.pause(bool);
 //   snd.oneShot('launch'|'flare'|'pop'|'boom'|'bang'|'rocket'|'crack', pos?);   // pos = [x,y,z] world; omitted = at the player
+//   HYPE kinds (no pos): 'tick' (my gun hit) 'thunk' (my missile hit) 'kill' (ding) 'stinger' 'levelup' 'pickup' 'drop' 'shield'
 //   snd.status()                      // { ctx ('running'...), muffleHz (the live low-pass), view, wind, pullUp, stall } for the harness
 //
 // WHAT YOU HEAR: the engine's roar (brown noise through a low-pass that opens with the throttle), the turbine whine, the
@@ -98,7 +99,30 @@ export function createSound() {
     g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(Math.max(0.0002, g0), t + 0.01); g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
     o.connect(g).connect(bus); o.start(t); o.stop(t + dur + 0.05);
   }
+  /** a short pitched note (osc + exp envelope), optionally through a low-pass; HYPE one-shots are built from these */
+  function tone(t, { type = 'sine', f0 = 880, f1 = f0, g0 = 0.12, att = 0.004, dur = 0.2, lp = 0 }) {
+    const o = A.createOscillator(), g = A.createGain(); o.type = type;
+    o.frequency.setValueAtTime(f0, t); if (f1 !== f0) o.frequency.exponentialRampToValueAtTime(f1, t + dur);
+    g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(Math.max(0.0002, g0), t + att); g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    let n = o.connect(g); if (lp) n = n.connect(filt('lowpass', lp, 0.7));
+    n.connect(bus); o.start(t); o.stop(t + dur + 0.05);
+  }
+  const ARP = (t, g, notes, gap, o) => { for (let i = 0; i < notes.length; i++) tone(t + i * gap, { ...o, f0: notes[i], g0: o.g0 * g }); };
   const SHOTS = {
+    // ---- HYPE lane (README "Hooks contract"): reward sounds, always at the player (no pos), short and soft-edged
+    tick: (t, g) => { tone(t, { f0: 2100, f1: 1500, g0: 0.09 * g, dur: 0.05 }); burst(t, { type: 'highpass', f0: 3200, q: 0.7, dur: 0.03, g0: 0.05 * g, att: 0.002 }); },
+    thunk: (t, g) => { thump(t, 75, 0.4 * g, 0.28); tone(t, { type: 'square', f0: 220, f1: 110, g0: 0.07 * g, dur: 0.12, lp: 900 }); burst(t, { type: 'lowpass', f0: 1200, f1: 300, dur: 0.15, g0: 0.15 * g, buf: sfx.brown }); },
+    kill: (t, g) => { tone(t, { f0: 1568, g0: 0.15 * g, att: 0.003, dur: 0.7 }); tone(t, { f0: 2349, g0: 0.06 * g, dur: 0.5 }); tone(t, { type: 'triangle', f0: 3136, g0: 0.025 * g, dur: 0.25 }); tone(t, { f0: 784, g0: 0.07 * g, dur: 0.4 }); },
+    stinger: (t, g) => {
+      ARP(t, g, [523.25, 659.25, 783.99], 0.06, { type: 'square', g0: 0.06, dur: 0.15, lp: 2200 });
+      for (const f of [523.25, 659.25, 783.99, 1046.5]) tone(t + 0.18, { type: 'sawtooth', f0: f, g0: 0.04 * g, att: 0.01, dur: 0.55, lp: 1800 });
+      thump(t + 0.18, 60, 0.3 * g, 0.3);
+    },
+    levelup: (t, g) => { ARP(t, g, [659.25, 783.99, 987.77, 1318.5, 1568], 0.07, { type: 'triangle', g0: 0.1, dur: 0.24 }); tone(t + 0.35, { f0: 2637, g0: 0.035 * g, dur: 0.6 }); },
+    pickup: (t, g) => { tone(t, { type: 'triangle', f0: 988, g0: 0.11 * g, dur: 0.09 }); tone(t + 0.07, { f0: 1480, g0: 0.12 * g, dur: 0.18 }); },
+    drop: (t, g) => { tone(t, { type: 'triangle', f0: 784, g0: 0.14 * g, dur: 0.35 }); tone(t + 0.28, { type: 'triangle', f0: 523.25, g0: 0.14 * g, dur: 0.5 }); thump(t, 55, 0.2 * g, 0.4); },
+    shield: (t, g) => { tone(t, { f0: 300, f1: 1200, g0: 0.1 * g, att: 0.02, dur: 0.3 }); burst(t, { f0: 800, f1: 4000, q: 2, dur: 0.35, g0: 0.08 * g, att: 0.02 }); tone(t + 0.2, { type: 'triangle', f0: 1200, g0: 0.04 * g, dur: 0.4 }); },
+
     launch: (t, g, p) => { burst(t, { f0: 500, f1: 2400, q: 0.8, dur: 0.9, g0: 0.35 * g, att: 0.03, pan: p }); burst(t, { type: 'lowpass', f0: 300, dur: 0.6, g0: 0.3 * g, buf: sfx.brown, pan: p }); },
     flare: (t, g, p) => { burst(t, { f0: 1800, q: 2, dur: 0.06, g0: 0.25 * g, pan: p }); thump(t, 90, 0.12 * g, 0.18); },
     pop: (t, g, p) => { burst(t, { f0: 1200, f1: 400, q: 1, dur: 0.35, g0: 0.3 * g, pan: p }); thump(t, 70, 0.2 * g, 0.4); },

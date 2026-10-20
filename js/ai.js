@@ -1,6 +1,7 @@
 // ai.js -- the AI pilot (lane COMBAT + AI, README "Phase 3 contract"). Pure: no three.js, no DOM, runs in node (ai.check.mjs).
 //
-//   const ai = createAI(fighter, { skill: 'easy'|'medium'|'hard', env, combat, seed });
+//   const ai = createAI(fighter, { skill: 'easy'|'medium'|'hard', env, combat, seed, pickups? });   // pickups = powerups.js items
+//   ai.setPickups(items | null);   // the same, later
 //   ai.think(dt, target);   // every step, BEFORE stepJet: writes fighter.ctl (aim, throttle, ab, gun, missile, flare)
 //
 // It flies through flight.js exactly like the mouse does (ctl.aim = the world direction it wants to fly), so it has no
@@ -15,6 +16,9 @@
 //           hard into one from the side or behind (it must out-turn the jet; combat.check's numbers); flares on the timing
 //   EXTEND  too slow: unload, afterburner, until the speed is back
 //   PATROL  no live target: back to the middle of the play area
+//   PICKUP  hurt (hp < pickHp) or out of missiles, and nothing on its tail: a detour to the nearest power-up within pickRange;
+//           any time: one close ahead (grabRange, grabCone) is snagged on the way. Held pickHold s (a missile warning still wins).
+//           (powerups.js items, given as the `pickups` option or ai.setPickups(items); none given = never)
 // and AVOID TERRAIN sits on top of all of them: the wanted direction's path is checked against terrainHeightAt; if it
 // comes too close the AI searches a fan of headings / climbs for the clear one nearest to what it wanted (it turns into
 // the valley rather than always climbing); an imminent impact on the current path is a full pull up.
@@ -75,6 +79,10 @@ export const AI_TUNE = {
   cornerV: 225,                           // m/s it holds in a turning fight (flight.js vCorner 215)
   errEvery: 0.5,                          // s between new aim-error targets
   bulletV: 1000,                          // m/s (combat TUNE.gunV) for the lead
+  pickHp: 0.5, pickRange: 4000,           // PICKUP: below this hp (or no missiles), a power-up this close (m)
+  grabRange: 1500, grabCone: 0.8,         // m, cos: a power-up this close and this near the nose is snagged anyway
+  pickHold: 4,                            // s a chosen power-up is kept (no flicker between PICKUP and ENGAGE)
+  chasedR: 2500,                          // m: an enemy this close in my rear hemisphere = chased (no detour)
 };
 
 // scratch (shared by every AI: think() is not re-entrant)
@@ -87,7 +95,7 @@ function noseOf(q, o) { const x = q[0], y = q[1], z = q[2], w = q[3]; o[0] = 2 *
  * @param {Object} fighter  README fighter (its ctl is written in place; aim gets its own array)
  * @param {{skill?:string, env:{terrainHeightAt:Function, playArea?:Object}, combat?:Object, seed?:number}} o
  */
-export function createAI(fighter, { skill = 'medium', env, combat = null, seed = 1 }) {
+export function createAI(fighter, { skill = 'medium', env, combat = null, seed = 1, pickups = null }) {
   const K = SKILL[skill] || SKILL.medium, A = AI_TUNE, rng = mulberry32(seed);
   // this pilot's own nerve (seeded): pulls a little more or less than the skill's g, so equal skills do not fight to a draw
   const gMax = Math.min(FT.nMax, K.gMax * (1 - A.gSpread + 2 * A.gSpread * rng()));
@@ -101,6 +109,29 @@ export function createAI(fighter, { skill = 'medium', env, combat = null, seed =
   let t = 0, errT = 0, state = 'patrol', warnT = 0, lastDist = 0, flareTti = 0, flareSkip = false, lastFlare = -99, lastMissile = -99, gunT = -99;
   let avoidT = -1, avoiding = false, lastOff = NaN, jinkT = 0, jinkSide = 1, jinkUp = 0;
   const avoidDir = [0, 0, -1];
+  let items = pickups, pick = null, pickT = 0;
+
+  /** PICKUP: the nearest live power-up within pickRange when hurt or out of missiles and not chased (into `pick`), else null */
+  function seekPickup(s, tgt) {
+    if (!items) return false;
+    if (pick && pick.alive && t < pickT) return true;
+    pick = null;
+    const needy = fighter.hp < A.pickHp || fighter.missiles === 0;
+    if (needy && tgt) {
+      const dx = tgt.s.pos[0] - s.pos[0], dy = tgt.s.pos[1] - s.pos[1], dz = tgt.s.pos[2] - s.pos[2];
+      if (dx * F[0] + dy * F[1] + dz * F[2] < 0 && dx * dx + dy * dy + dz * dz < A.chasedR * A.chasedR) return false;
+    }
+    let bd = Infinity;
+    for (let i = 0; i < items.length; i++) {
+      const it = items[i];
+      if (!it.alive) continue;
+      const dx = it.pos[0] - s.pos[0], dy = it.pos[1] - s.pos[1], dz = it.pos[2] - s.pos[2], d = Math.hypot(dx, dy, dz);
+      const ok = needy ? d < A.pickRange : d < A.grabRange && dx * F[0] + dy * F[1] + dz * F[2] > A.grabCone * d;
+      if (ok && d < bd) { bd = d; pick = it; }
+    }
+    if (pick) pickT = t + A.pickHold;
+    return !!pick;
+  }
 
   /** the least clearance (m) over the ground along a path that turns from the current velocity onto dir */
   function clearance(s, dir, v) {
@@ -113,7 +144,7 @@ export function createAI(fighter, { skill = 'medium', env, combat = null, seed =
     return m;
   }
   /** turn `want` (unit) into a direction clear of the ground (in place) */
-  function avoidTerrain(s, want, v) {
+  function avoidTerrain(s, want, v, lenient) {
     const margin = K.minAlt * 0.6;
     // 1. the current path hits the ground soon, or a dive is steeper than the height left can pull it out of (a roll, then an
     //    arc at ~pullOutG): everything into a climb along the current heading
@@ -127,8 +158,8 @@ export function createAI(fighter, { skill = 'medium', env, combat = null, seed =
         return 2;
       }
     }
-    // 2. the wanted path is clear: keep it (and stop any held avoidance once it has been clear a moment)
-    if (clearance(s, want, v) >= margin) { avoiding = false; return 0; }
+    // 2. the wanted path is clear (or lenient: the final run at a power-up, which hangs over the ground; only 1. guards it): keep it
+    if (lenient || clearance(s, want, v) >= margin) { avoiding = false; return 0; }
     // 3. search the fan (held for avoidEvery s): the clear direction nearest the wanted one, else the highest clearance
     if (!avoiding || t - avoidT >= A.avoidEvery) {
       avoiding = true; avoidT = t;
@@ -193,9 +224,10 @@ export function createAI(fighter, { skill = 'medium', env, combat = null, seed =
       if (warnT === 0) { flareTti = K.flareTti[0] + (K.flareTti[1] - K.flareTti[0]) * rng(); flareSkip = rng() < K.flareForget; }
       warnT += dt;
     } else warnT = 0;
-    if (!tgt) state = 'patrol';
+    if (!tgt) state = seekPickup(s, null) ? 'pickup' : 'patrol';
     else if (warnT > (K.defendReact ?? K.react)) state = 'defend';   // defendReact: a missile is answered later than a turn
     else if (state === 'extend' ? v < A.extendUntil : v < A.extendBelow) state = 'extend';
+    else if (seekPickup(s, tgt)) state = 'pickup';
     else state = 'engage';
 
     let thr = 0.84, ab = false, brake = false, gunSolution = false, R = 0;
@@ -203,6 +235,9 @@ export function createAI(fighter, { skill = 'medium', env, combat = null, seed =
       const cx = pa ? pa.cx : 0, cz = pa ? pa.cz : 0, dx = cx - s.pos[0], dz = cz - s.pos[2], d = Math.hypot(dx, dz);
       if (d > 3000) { aim[0] = dx / d; aim[1] = 0; aim[2] = dz / d; } else { aim[0] = F[0]; aim[1] = 0; aim[2] = F[2]; }
       norm(aim); thr = 0.75;
+    } else if (state === 'pickup') {
+      for (let j = 0; j < 3; j++) aim[j] = pick.pos[j] - s.pos[j];
+      R = norm(aim); thr = 1; ab = K.ab;
     } else if (state === 'extend') {
       aim[0] = F[0]; aim[1] = -0.08; aim[2] = F[2]; norm(aim); thr = 1; ab = true;
     } else if (state === 'defend') {
@@ -269,9 +304,8 @@ export function createAI(fighter, { skill = 'medium', env, combat = null, seed =
       }
     }
     lastDist = f.warn.dist;
-    if (state === 'engage' || state === 'defend') {
-      for (let j = 0; j < 3; j++) aim[j] += err[j];
-      norm(aim);
+    if (state === 'engage' || state === 'defend' || state === 'pickup') {
+      if (state !== 'pickup') { for (let j = 0; j < 3; j++) aim[j] += err[j]; norm(aim); }
       // slow: pull less (keep the energy: a turn at the lift limit bleeds it fast and a slow jet turns worse)
       limitG(aim, v, gMax * clamp((v - A.extendBelow) / (A.cornerV - A.extendBelow), 0.5, 1));
     }
@@ -281,10 +315,10 @@ export function createAI(fighter, { skill = 'medium', env, combat = null, seed =
       if (out > 0) { const w = clamp(out / 2000, 0, 0.8), d = Math.hypot(dx, dz) || 1; aim[0] = aim[0] * (1 - w) - dx / d * w; aim[2] = aim[2] * (1 - w) - dz / d * w; norm(aim); }
     }
     // AVOID TERRAIN: always last, always wins
-    const av = avoidTerrain(s, aim, v);
+    const av = avoidTerrain(s, aim, v, state === 'pickup' && R < A.grabRange);
     if (av) { thr = Math.max(thr, 0.84); ab = ab || av === 2 || v < 170; ctl.gun = ctl.gun && av !== 2; }
     ctl.throttle = thr; ctl.ab = ab; ctl.brake = brake && !av;
   }
 
-  return { think, get state() { return state; }, get gunOff() { return lastOff; }, skill: K, gMax };
+  return { think, get state() { return state; }, get gunOff() { return lastOff; }, skill: K, gMax, setPickups(list) { items = list || null; } };
 }

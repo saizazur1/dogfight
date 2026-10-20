@@ -14,7 +14,8 @@ const [url, secs = '20', w = '1512', h = '982', dpr = '2'] = pos;
 if (!url) { console.error('usage: node tools/perf.mjs <url> [seconds] [w] [h] [dpr] [--headed] [--settle=3]'); process.exit(1); }
 const headed = flags.includes('--headed');
 const settle = +(flags.find((f) => f.startsWith('--settle='))?.slice(9) ?? 3);
-const PORT = 9343;
+const PORT = +(process.env.PORT || 9343);
+const profile = mkdtempSync(join(tmpdir(), 'perf-'));   // removed again in finally (230 leftovers once filled the disk)
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const chromeArgs = [
@@ -28,7 +29,6 @@ const chromeArgs = [
 ];
 if (headed) chromeArgs.push('--window-position=-2400,0', `--window-size=${w},${+h + 28}`, '--app=about:blank');   // +28: the macOS title bar
 else chromeArgs.push('--headless=new', `--window-size=${w},${h}`, 'about:blank');
-const profile = mkdtempSync(join(tmpdir(), 'perf-'));   // removed again in finally (230 leftovers once filled the disk)
 const chrome = spawn('/Applications/Google Chrome.app/Contents/MacOS/Google Chrome', chromeArgs, { stdio: 'ignore' });
 
 const pct = (a, p) => a[Math.min(a.length - 1, Math.floor(a.length * p))];

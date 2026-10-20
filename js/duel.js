@@ -44,6 +44,7 @@ export function createDuelMode(game) {
 
   const mode = {
     id: 'duel', title: 'Duel',
+    powerups: { count: 4, dropEvery: 60 },
     get phase() { return phase; }, get round() { return round; }, get clock() { return clock; }, score,
     start() {
       score.me = score.enemy = 0; round = 0;

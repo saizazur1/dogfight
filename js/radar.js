@@ -1,12 +1,14 @@
 // radar.js -- the round radar, bottom-left above the health box (lane UI, phase 4). One <canvas>, heading-up, 8 km range, ring at 4 km.
 //
 //   const radar = createRadar(root);          // root = the HUD's overlay element (position fixed / relative, full size); the canvas goes into it
-//   radar.update(me, fighters, combat, playArea, camera);   // every display frame; it redraws itself at most 30 times a second
+//   radar.update(me, fighters, combat, playArea, camera, items?);   // every display frame; it redraws itself at most 30 times a second
 //   radar.setVisible(bool);  radar.setMode('chase'|'cockpit'|null);   // null (default) = auto: green when root or a child has class 'cp' (hud.js sets it)
 //
 //   me, fighters   README fighter records (s.pos, s.q, alive, id); `fighters` may include me (skipped)
 //   combat         { missiles: [{ owner, target, pos[3], alive }] } or null;  playArea { cx, cz, half } (a square) or null
 //   camera         unused for now (the radar turns with MY nose heading, not the camera)
+//   items          powerups.js items (optional): pick-ups as small squares in their kind's colour (in range only), a supply drop
+//                  as a pulsing gold diamond (pinned to the rim when out of range)
 // Shows: enemies as red triangles pointing their heading (beyond range: pinned to the rim and dimmed), my missiles as small white dots,
 // missiles chasing me as red blinking dots, the play-area boundary as an amber line, and a small N. Nothing is allocated per frame.
 
@@ -21,6 +23,7 @@ const SIZE = 170, PAD = 15, BOX = SIZE + 2 * PAD, C = BOX / 2, R = SIZE / 2 - 3,
 const RATE_MS = 1000 / 30;
 const DASH = [5, 4], NODASH = [];
 const TAU = Math.PI * 2;
+const KIND_COL = { repair: '#3ddc84', missiles: '#ff9a2e', boost: '#35d0ff', shield: '#b07cff', drop: '#ffd84a' };
 let PX = 0, PY = 0;   // rel()'s result (canvas px)
 
 /** @param {HTMLElement} root @returns {{update:Function, setVisible:(on:boolean)=>void, setMode:(m:string|null)=>void, el:HTMLElement}} */
@@ -42,7 +45,7 @@ export function createRadar(root) {
   function setTint(on) { if (on !== tint) { tint = on; el.classList.toggle('cp', on); } }
 
   /** Redraws when 33 ms passed. Cheap to call every frame. */
-  function update(me, fighters, combat, playArea, camera) { // eslint-disable-line no-unused-vars
+  function update(me, fighters, combat, playArea, camera, items) { // eslint-disable-line no-unused-vars
     if (!visible || !me) return;
     const now = performance.now();
     if (now - lastDraw < RATE_MS) return;
@@ -67,6 +70,24 @@ export function createRadar(root) {
       ctx.strokeStyle = '#ffb43a'; ctx.lineWidth = 2; ctx.setLineDash(DASH); ctx.beginPath();
       rel(x0, z0); ctx.moveTo(PX, PY); rel(x1, z0); ctx.lineTo(PX, PY); rel(x1, z1); ctx.lineTo(PX, PY); rel(x0, z1); ctx.lineTo(PX, PY); ctx.closePath(); ctx.stroke();
       ctx.setLineDash(NODASH);
+    }
+    if (items) {   // power-ups: squares in range; supply drops: a pulsing diamond, pinned to the rim beyond the range
+      const pulse = 0.5 + 0.5 * Math.sin(now / 160);
+      ctx.strokeStyle = 'rgba(0,0,0,.6)'; ctx.lineWidth = 1;
+      for (let i = 0; i < items.length; i++) {
+        const it = items[i];
+        if (!it.alive) continue;
+        rel(it.pos[0], it.pos[2]);
+        let dx = PX - C, dy = PY - C;
+        const dist = Math.hypot(dx, dy);
+        ctx.fillStyle = KIND_COL[it.kind] || '#fff';
+        if (!it.drop) { if (dist > R - 3) continue; ctx.fillRect(PX - 2.5, PY - 2.5, 5, 5); ctx.strokeRect(PX - 2.5, PY - 2.5, 5, 5); continue; }
+        if (dist > R - 7) { const k = (R - 7) / dist; dx *= k; dy *= k; }
+        const r = 4.5 + 2 * pulse;
+        ctx.globalAlpha = 0.65 + 0.35 * pulse;
+        ctx.beginPath(); ctx.moveTo(C + dx, C + dy - r); ctx.lineTo(C + dx + r, C + dy); ctx.lineTo(C + dx, C + dy + r); ctx.lineTo(C + dx - r, C + dy); ctx.closePath();
+        ctx.fill(); ctx.stroke(); ctx.globalAlpha = 1;
+      }
     }
     if (combat && combat.missiles) {
       const blink = (now / 170) & 1;

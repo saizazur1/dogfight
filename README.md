@@ -156,7 +156,7 @@ game = {
   spawnAI({ pos, heading, speed, skill, name, color }) -> fighter,   // pooled; joins combat; returns the fighter
   despawn(fighter),                     // returns it to the pool (hidden, out of combat)
   respawnMe({ pos, heading, speed }),   // fresh JetState + full hp/ammo for the player
-  safeSpawn(i, n) -> { pos, heading, speed },   // n well-spread, terrain-safe starts in the play area (i-th)
+  safeSpawn(i, n, radius?) -> { pos, heading, speed },   // n well-spread, terrain-safe starts on a ring (i-th)
   setBanner(text|null),                 // small persistent top-centre line (mode info: timer, wave, rings)
   finish({ title, sub, won }),          // ends the mode: big card, "Space: again · Esc: menu"
   t,                                    // sim time
@@ -247,3 +247,7 @@ const pfx = createPowerupFx(scene, world);  pfx.update(frameDt, pu, fighters, ca
 everyone, a live top-3 banner and a final leaderboard. A mode may declare `powerups: { count, dropEvery }` (false / missing = none);
 `game.powerups` is the live `pu` (or null). Chaos uses lots; duel and survival a few plus a drop each minute.
 Defaults game.js uses: trail style `'vapor'` (thin white wingtip vapour, free, also every AI's) and `'none'`; finish `'gloss'` (today's look).
+As built: `missileHit` / `gunHit` on a shielded jet carry `shielded: true` (game.js keeps them from the hype and the XP). Chaos is
+arcade: one missile kills and the gun hits 1.5x harder (combat.TUNE, put back in its stop()); pick-ups stay within ARENA_R + 1.5 km
+(`pu.start({ radius })`); AI targets are sticky (kept unless another jet is under half as far). `?nohooks` (test only) runs the
+game without the hooks, to A/B their cost.
