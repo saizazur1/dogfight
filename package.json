@@ -3,7 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "serve": "python3 -m http.server 8320 --bind 127.0.0.1",
+    "serve": "python3 tools/serve.py 8320",
     "check": "node js/flight.check.mjs"
   },
   "devDependencies": { "three": "0.186.0" }

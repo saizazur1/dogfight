@@ -5,7 +5,7 @@ A browser jet dogfight game. Three.js 0.186, plain ES modules from the jsDelivr 
 Serve the folder and open the game:
 
 ```bash
-python3 -m http.server 8320 --bind 127.0.0.1
+python3 tools/serve.py
 ```
 
 Then open http://localhost:8320/ in Chrome. Add `?perf=1` for the fps readout.
