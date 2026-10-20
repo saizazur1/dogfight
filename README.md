@@ -91,3 +91,53 @@ controls.locked               // pointer lock state
 const cam = createChaseCam(camera);  cam.update(frameDt, pose, aim, s);  cam.snap();
 const hud = createHud(root);         hud.update(camera, pose, aim, s);
 ```
+
+## Phase 3 contract: the fight
+
+Every jet (the player's, the AI's, later remote players') is the same **fighter** record. Its pilot (mouse, AI, network) only writes `f.ctl`, once per 120 Hz step. Everything that happens is an **event** record (later sent over the network as is).
+
+```js
+fighter = {
+  id: 0,                // small integer, unique in the match
+  name: 'Falcon 427', color: '#c8362c', isAI: false,
+  s,                    // flight.js JetState (pos, vel, q, speed, crashed, ...)
+  ctl,                  // flight.js ctl + { gun: bool (held), missile: bool (edge: true for one step), flare: bool (edge) }
+  // combat.js owns and writes these:
+  hp: 1,                // 0..1; 0 = shot down
+  alive: true,
+  missiles: 4, flares: 3, gunAmmo: 400,
+  lock: { target: -1, progress: 0, locked: false },   // seeker on the nose
+  warn: { missile: false, dir: [0, 0, 0], dist: 0 },  // nearest missile chasing this fighter
+};
+```
+
+### combat.js (pure, no Three.js, runs in node; `combat.check.mjs`)
+
+```js
+const combat = createCombat({ terrainHeightAt, seed, onEvent });
+combat.add(fighter);  combat.reset(fighter);           // reset = full hp, ammo, lock cleared (new round)
+combat.step(dt);                                        // AFTER every fighter's stepJet for this step
+combat.missiles  // [{ id, owner, target, pos[3], vel[3], age, motor 0..1, alive, decoy: -1|flareIndex }]
+combat.bullets   // [{ owner, pos[3], vel[3], age, alive }]  (tracers)
+combat.flares    // [{ owner, pos[3], vel[3], age, burn 0..1, alive }]
+combat.TUNE      // every weapon number in one place
+```
+
+Events (`onEvent(e)`, `e.t` = sim time): `missileFired {owner, missile}`, `missileHit {missile, target, pos}`, `missileGone {missile, reason: 'decoyed'|'fuel'|'ground'}`, `gunFired {owner}` (≤ 10 Hz, for sound), `gunHit {owner, target, pos}`, `flare {owner, pos}`, `lockOn {owner, target}`, `lockLost {owner}`, `warning {target, on}`, `kill {killer, victim, cause: 'missile'|'gun'|'crash'}`.
+
+### ai.js (pure, runs in node; `ai.check.mjs`)
+
+```js
+const ai = createAI(fighter, { skill: 'easy'|'medium'|'hard', env, combat, seed });
+ai.think(dt, target);   // every step, BEFORE stepJet: writes fighter.ctl (aim, throttle, ab, gun, missile, flare)
+```
+
+### weaponfx.js (Three.js), hud.js, sound.js
+
+```js
+const wfx = createWeaponFx(scene, { buildMissile: jet.buildMissile, world });
+wfx.onEvent(e);  wfx.update(frameDt, combat, camera);
+hud.setFight({ me, enemy, combat, score: { me: 0, enemy: 0, round: 1 } });   // then hud.update as before
+sound.onEvent(e, meId);  // lock growl / lock tone / missile warning / launch / gun / hits
+cards.show('round'|'roundWin'|'roundLose'|'win'|'lose', { text, sub })   // big centred round cards, hide()
+```
