@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tutorial Bench</title>
+<link href="https://fonts.googleapis.com/css2?family=Rubik:wght@500;700;800&display=swap" rel="stylesheet">
+<style>
+  html, body { margin: 0; height: 100%; background: #0b1018; overflow: hidden; font-family: Rubik, system-ui, sans-serif; }
+  canvas { display: block; width: 100vw; height: 100vh; }
+  #hud { position: fixed; inset: 0; pointer-events: none; }
+  #banner { position: fixed; left: 50%; top: 60px; transform: translateX(-50%); color: #fff; font: 600 14px Rubik, system-ui; letter-spacing: 1px; background: rgba(12,14,20,.55); padding: 4px 14px; border-radius: 10px; pointer-events: none; }
+  #banner:empty { display: none; }
+  #dbg { position: fixed; left: 10px; top: 8px; color: #fff; font: 11px ui-monospace, Menlo, monospace; opacity: .7; white-space: pre; pointer-events: none; }
+</style>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.186.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.186.0/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hud"></div><div id="banner"></div><div id="dbg"></div>
+<script type="module">
+// tutorial.html -- the TUTORIAL lane's bench: a minimal stand-in for the README "Modes contract" game object (jetworld,
+// two pooled jets, flight + combat + ai at 120 Hz, chase cam, hud, weaponfx, cards) running js/tutorial.js. Params:
+//   ?step=N   start at step N (1..10; 11 = the finish card)      ?auto=1  fake-complete a step every 3 s (sim time)
+//   ?stopAt=<s>  freeze the sim at this many sim seconds (screenshots)   ?flat=1  simple ground
+import * as THREE from 'three';
+import { createJet, stepJet, jetModelState } from './js/flight.js';
+import { createCombat, RAIL_ORDER } from './js/combat.js';
+import { createAI } from './js/ai.js';
+import { createControls } from './js/controls.js';
+import { createChaseCam } from './js/chasecam.js';
+import { createHud } from './js/hud.js';
+import { createCards } from './js/cards.js';
+import { createWeaponFx } from './js/weaponfx.js';
+import { buildJet } from './js/jetmodel.js';
+import { poseMatrix } from './js/jetspec.js';
+import { createTutorialMode } from './js/tutorial.js';
+
+const P = new URLSearchParams(location.search), DT = 1 / 120;
+const STEP = +(P.get('step') || 1), AUTO = P.get('auto') === '1', STOP_AT = +(P.get('stopAt') || 0);
+const $ = (id) => document.getElementById(id), canvas = $('c');
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: false, logarithmicDepthBuffer: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 1.5)); renderer.setSize(innerWidth, innerHeight, false);
+renderer.toneMapping = THREE.AgXToneMapping;
+const scene = new THREE.Scene(), camera = new THREE.PerspectiveCamera(68, innerWidth / innerHeight, 0.5, 4e5);
+addEventListener('resize', () => { renderer.setSize(innerWidth, innerHeight, false); camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix(); });
+
+function flatWorld() {
+  const h = (x, z) => 600 + 900 * Math.max(0, Math.sin(x / 2300) * Math.cos(z / 2900)) ** 1.5 + 120 * Math.sin(x / 700 + z / 900);
+  const geo = new THREE.PlaneGeometry(40000, 40000, 256, 256); geo.rotateX(-Math.PI / 2);
+  const p = geo.attributes.position; for (let i = 0; i < p.count; i++) p.setY(i, h(p.getX(i), p.getZ(i)));
+  geo.computeVertexNormals();
+  scene.add(new THREE.Mesh(geo, new THREE.MeshStandardMaterial({ color: 0x8a8f85, roughness: 1, flatShading: true })), new THREE.HemisphereLight(0xbfd8ff, 0x55504a, 2));
+  scene.background = new THREE.Color(0x9cc3e6);
+  return { terrainHeightAt: h, exposure: 1, update() {}, applyEnv() {}, playArea: { cx: 0, cz: 0, half: 15000, ceiling: 6000 }, spawn: { pos: [0, 2200, 6000], heading: 0, speed: 220 } };
+}
+let world;
+if (P.get('flat') === '1') world = flatWorld();
+else { try { const { buildJetWorld } = await import('./js/jetworld.js'); world = await buildJetWorld(scene, renderer, { seed: 7 }); } catch (e) { console.warn(e); world = flatWorld(); } }
+renderer.toneMappingExposure = world.exposure ?? 1;
+const th = world.terrainHeightAt, env = { terrainHeightAt: th, playArea: world.playArea };
+
+// ---------------------------------------------------------------- the stand-in game
+let mode = null; const evlog = [];
+const combat = createCombat({ terrainHeightAt: th, seed: 7, onEvent: (e) => { if (e.type !== 'gunFired') evlog.push(`${e.t.toFixed(1)} ${e.type} ${e.owner ?? e.missile ?? ''} ${e.target ?? e.reason ?? ''}`); hud.onEvent(e, 0); wfx.onEvent(e); mode?.onEvent(e); } });
+const controls = createControls({ canvas });
+const hud = createHud($('hud')); hud.setEnv(env);
+const cards = createCards(document.body);
+const pool = [0, 1].map((id) => {
+  const jet = buildJet(id, {}); jet.group.matrixAutoUpdate = false; jet.group.visible = false; scene.add(jet.group); world.applyEnv?.(jet.group, 1);
+  return { id, name: id ? 'Drone' : 'You', color: id ? '#e7e7ea' : '#c8362c', isAI: !!id, s: null, alive: false, jet, ai: null, target: null,
+    ctl: id ? { aim: [0, 0, -1], pitch: 0, roll: 0, yaw: 0, throttle: 0.84, ab: false, brake: false, gun: false, missile: false, flare: false } : controls.ctl,
+    prev: { pos: [0, 0, 0], q: [0, 0, 0, 1] }, pose: { pos: [0, 0, 0], q: [0, 0, 0, 1] }, model: { rails: [1, 1, 1, 1] } };
+});
+const wfx = createWeaponFx(scene, { buildMissile: pool[0].jet.buildMissile, world });
+const me = pool[0], fighters = [me];
+const cam = createChaseCam(camera); cam.setEnv(env);
+function place(f, sp) {
+  f.s = createJet(sp); combat.add(f); combat.reset(f); f.jet.group.visible = true;
+  f.prev.pos = f.s.pos.slice(); f.prev.q = f.s.q.slice();
+}
+const game = {
+  world, scene, camera, env, combat, controls, hud, cards, sound: null, wfx, params: P, profile: { name: 'You', color: '#c8362c', skill: 'easy' },
+  me, fighters, t: 0,
+  spawnAI(o) {
+    const f = pool[1]; place(f, o); f.target = null; f.name = o.name || 'AI';
+    f.ai = createAI(f, { skill: o.skill || 'easy', env, combat, seed: 11 });
+    if (!fighters.includes(f)) fighters.push(f);
+    return f;
+  },
+  despawn(f) { combat.reset(f); f.alive = false; f.jet.group.visible = false; f.ai = null; const k = fighters.indexOf(f); if (k > 0) fighters.splice(k, 1); },
+  respawnMe(sp) { place(me, sp); controls.reset(sp.heading, 0); controls.ctl.throttle = 0.84; cam.snap(); },
+  safeSpawn() { const sp = world.spawn; return { pos: [sp.pos[0], Math.max(sp.pos[1], th(sp.pos[0], sp.pos[2]) + 500), sp.pos[2]], heading: sp.heading, speed: 230 }; },
+  setBanner(t) { $('banner').textContent = t || ''; },
+  finish({ title, sub, won }) { finished = true; cards.show(won ? 'win' : 'lose', { text: title, sub: `${sub} · Space: again · Esc: menu`, ms: 0 }); },
+};
+let finished = false;
+game.respawnMe(game.safeSpawn());
+mode = createTutorialMode(game);
+mode.start(STEP);
+
+function simStep() {
+  game.t += DT;
+  for (const f of fighters) { f.prev.pos[0] = f.s.pos[0]; f.prev.pos[1] = f.s.pos[1]; f.prev.pos[2] = f.s.pos[2]; for (let j = 0; j < 4; j++) f.prev.q[j] = f.s.q[j]; }
+  for (const f of fighters) if (f.ai && f.alive) f.ai.think(DT, f.target || me);
+  for (const f of fighters) if (f.alive && !f.s.crashed) stepJet(f.s, f.ctl, DT, env);
+  combat.step(DT);
+  controls.consumeEdges();
+  if (!finished) mode.step(DT);
+  if (AUTO && !finished && game.t % 3 < DT) mode.skipStep();
+}
+
+const qa = new THREE.Quaternion(), qb = new THREE.Quaternion(), mat = new Array(16);
+let acc = 0, last = performance.now();
+function frame(now) {
+  const fdt = Math.min((now - last) / 1000, 0.1); last = now;
+  controls.update(fdt, me.s);
+  if (!STOP_AT || game.t < STOP_AT) acc += fdt;
+  while (acc >= DT) { acc -= DT; simStep(); }
+  const a = acc / DT;
+  for (const f of pool) {
+    if (!f.s) continue;
+    for (let j = 0; j < 3; j++) f.pose.pos[j] = f.prev.pos[j] + (f.s.pos[j] - f.prev.pos[j]) * a;
+    qa.fromArray(f.prev.q); qb.fromArray(f.s.q); qa.slerp(qb, a); qa.toArray(f.pose.q);
+    f.jet.group.matrix.fromArray(poseMatrix(f.pose.pos, f.pose.q, mat)); f.jet.group.matrixWorldNeedsUpdate = true;
+    f.jet.group.visible = f.alive && !f.s.crashed && fighters.includes(f);
+    jetModelState(f.s, f.model); for (let r = 0; r < 4; r++) f.model.rails[RAIL_ORDER[r]] = r < 4 - f.missiles ? 0 : 1; f.jet.setState(f.model);
+  }
+  cam.update(fdt, me.pose, controls.ctl.aim, me.s, controls.look);
+  world.update(game.t, camera);
+  wfx.update(fdt, combat, camera);
+  hud.setFight({ me, enemies: fighters.slice(1), combat });
+  hud.update(camera, me.pose, controls.ctl.aim, me.s);
+  mode.frame(fdt);
+  $('dbg').textContent = `t ${game.t.toFixed(1)} step ${mode.index + 1} view ${controls.view} hp ${me.hp.toFixed(2)} lock ${me.lock.locked ? 'LOCK' : me.lock.progress.toFixed(2)}`;
+  renderer.render(scene, camera);
+  requestAnimationFrame(frame);
+}
+window.__tut = { game, mode, combat, evlog };
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

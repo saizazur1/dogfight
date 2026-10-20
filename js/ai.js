@@ -31,6 +31,7 @@ const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
 export const SKILL = {
   easy: {
     react: 0.9,            // s: it sees the target this late (extrapolated), and answers a missile warning this late
+                           // (defendReact, optional: a later answer to a missile than react)
     aimErrDeg: 5,          // the wandering aim error (deg, rms-ish)
     gMax: 5.0,             // g it pulls at most in a fight (terrain escapes use everything)
     flareTti: [3.5, 6],    // s to impact it pops flares at (drawn per missile; > ~3 s is early = poor odds)
@@ -45,11 +46,11 @@ export const SKILL = {
     headOn: false,         // takes head-on gun snapshots
   },
   medium: {
-    react: 0.45, aimErrDeg: 2.2, gMax: 7.0, flareTti: [0.9, 4.5], flareForget: 0.15, missileGap: 6, missileRange: [550, 3200],
+    react: 0.45, defendReact: 0.9, aimErrDeg: 2.2, gMax: 7.0, flareTti: [0.9, 4.5], flareForget: 0.3, missileGap: 6, missileRange: [550, 3200],
     gunRange: 750, gunConeDeg: 2, gunHold: 0.4, minAlt: 300, ab: true, defend: true, missileAspect: -0.5, headOn: true,
   },
   hard: {
-    react: 0.18, aimErrDeg: 0.8, gMax: 8.5, flareTti: [1.1, 2.8], flareForget: 0.05, missileGap: 3.5, missileRange: [450, 2800],
+    react: 0.18, aimErrDeg: 0.8, gMax: 8.5, flareTti: [1.2, 2.4], flareForget: 0, missileGap: 3, missileRange: [450, 2800],
     gunRange: 900, gunConeDeg: 1.5, gunHold: 0.3, minAlt: 140, ab: true, defend: true, missileAspect: -0.2, headOn: true,
   },
 };
@@ -193,7 +194,7 @@ export function createAI(fighter, { skill = 'medium', env, combat = null, seed =
       warnT += dt;
     } else warnT = 0;
     if (!tgt) state = 'patrol';
-    else if (warnT > K.react) state = 'defend';
+    else if (warnT > (K.defendReact ?? K.react)) state = 'defend';   // defendReact: a missile is answered later than a turn
     else if (state === 'extend' ? v < A.extendUntil : v < A.extendBelow) state = 'extend';
     else state = 'engage';
 

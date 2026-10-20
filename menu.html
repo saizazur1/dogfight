@@ -26,12 +26,21 @@ import { createHud } from './js/hud.js';
 import { createSound } from './js/sound.js';
 import { createCards } from './js/cards.js';
 import { quatFromEuler } from './js/jetspec.js';
+import { createRadar } from './js/radar.js';
 
 // Bench: ?mode=chase|cockpit shows the HUD with a fake jet; ?screen=start|pause|settings shows the menu; ?static=1 freezes the motion.
 // PHASE 3: ?fight=1 (with mode, default chase) adds a fake me + enemy: &enemy=on|near|left|right|behind|up  &lock=0..1 (1 = locked)
 //   &warn=<missile distance m>&warnAng=<deg from my nose>  &card=round|roundWin|roundLose|win|lose|count
 const P = new URLSearchParams(location.search);
-const fightOn = P.has('fight'), mode = P.get('mode') || (fightOn ? 'chase' : null), screen = P.get('screen') || (mode ? 'none' : 'start');
+// PHASE 4: ?radar=1 (radar + health box, fake fighters ahead-left / behind / out of range, a missile chasing me; &mode=cockpit for green)
+//   ?banner=1[&text=RING 4/16 · 0:42.3] (banner alone; add &fight=1 for under the score bar; &enemies=1 = survival-style list, no score/bar)
+//   ?screen=start shows the mode picker. &store=race,survival,done / none fakes localStorage bests / tutorialDone (set BEFORE the menu is built).
+const radarOn = P.has('radar'), bannerOn = P.has('banner');
+try { if (P.has('store')) { const st = P.get('store').split(','); if (st.includes('race')) localStorage.setItem('dogfight.raceBest.7', '95.04'); else localStorage.removeItem('dogfight.raceBest.7');
+  if (st.includes('survival')) localStorage.setItem('dogfight.survivalBest', '7'); else localStorage.removeItem('dogfight.survivalBest');
+  if (st.includes('done')) localStorage.setItem('dogfight.tutorialDone', '1'); else localStorage.removeItem('dogfight.tutorialDone'); }
+  if (P.has('fresh')) localStorage.removeItem('dogfight.menu.v1'); } catch { /* no storage */ }
+const fightOn = P.has('fight') || radarOn, mode = P.get('mode') || (fightOn || bannerOn ? 'chase' : null), screen = P.get('screen') || (mode ? 'none' : 'start');
 const log = [];   // read by tools: window.__bench.log
 const snd = createSound();
 const cards = createCards(document.body);
@@ -57,9 +66,13 @@ const fo = (id, name, isAI) => ({ id, name, isAI, s: { pos: [0, 0, 0], vel: [0, 
 const meF = fo(0, 'Falcon 427', false), enF = fo(1, 'Viper 21', true), combatF = { missiles: [], bullets: [], flares: [] };
 Object.assign(meF, { hp: 0.8, missiles: 3, flares: 2, gunAmmo: 312 }); enF.hp = 0.6;
 const scoreF = { me: 1, enemy: 0, round: 2 };
+const e2F = fo(2, 'Raven 88', true), e3F = fo(3, 'Hawk 5', true), mislist = [{ id: 1, owner: 1, target: 0, pos: [0, 0, 0], alive: true }, { id: 2, owner: 0, target: 1, pos: [0, 0, 0], alive: true }];
+const radar = radarOn ? createRadar(document.getElementById('hud')) : null, allF = [meF, enF, e2F, e3F], combatR = { missiles: mislist, bullets: [], flares: [] };
+const AREA = { cx: 9500, cz: 2000, half: 15000 };
 const SCN = { on: [0.04, 0.03, 2400], near: [0.03, 0.02, 800], left: [-1.1, 0, 2600], right: [1.2, 0.1, 1500], behind: [3.0, 0, 900], up: [0.1, 0.9, 1800] };
 const scn = { k: P.get('enemy') || 'on', lock: +(P.get('lock') || 0), warn: +(P.get('warn') || 0), warnAng: +(P.get('warnAng') || 150) * Math.PI / 180, gun: false };
-if (fightOn) hud.setFight({ me: meF, enemy: enF, combat: combatF, score: scoreF });
+if (fightOn) hud.setFight(P.has('enemies') ? { me: meF, enemies: [enF, e2F, e3F], combat: combatF } : { me: meF, enemy: enF, combat: combatF, score: bannerOn && !P.has('fight') ? null : scoreF });
+if (bannerOn) hud.setBanner(P.get('text') || 'RING 4/16 · 0:42.3');
 if (fightOn) snd.setFight({ me: meF, enemy: enF, combat: combatF });
 if (P.get('card')) cards.show(P.get('card'), { ms: 0, text: P.get('card') === 'count' ? '3' : undefined });
 let view = mode === 'chase' ? 'chase' : 'cockpit', t0 = performance.now();
@@ -78,6 +91,14 @@ function frame(now) {
   if (fightOn) {
     const [dh, dp, dist] = SCN[scn.k], d = dir(h + dh, p + dp), ev = dir(h + dh + 1.2, 0);
     for (let i = 0; i < 3; i++) { enF.s.pos[i] = pose.pos[i] + d[i] * dist; enF.s.vel[i] = ev[i] * 240; meF.s.pos[i] = pose.pos[i]; meF.s.vel[i] = fake.vel[i]; }
+    meF.s.q = pose.q;
+    if (radar) {   // bench for the radar: bearing is relative to my heading, h
+      const place = (f, brg, dist, hdg) => { const dd = dir(h + brg, 0); f.s.pos[0] = pose.pos[0] + dd[0] * dist; f.s.pos[1] = pose.pos[1]; f.s.pos[2] = pose.pos[2] + dd[2] * dist; f.s.q = quatFromEuler(h + hdg, 0, 0, f.s.q || [0, 0, 0, 1]); };
+      place(enF, -0.6, 4800, 1.2); place(e2F, 3.4, 2600, 0.2); place(e3F, 0.9, 13000, 3);
+      mislist[0].pos[0] = pose.pos[0] + dir(h + 2.6, 0)[0] * 1800; mislist[0].pos[2] = pose.pos[2] + dir(h + 2.6, 0)[2] * 1800;
+      mislist[1].pos[0] = pose.pos[0] + dir(h + 0.15, 0)[0] * 3000; mislist[1].pos[2] = pose.pos[2] + dir(h + 0.15, 0)[2] * 3000;
+      radar.update(meF, allF, combatR, AREA, camera);
+    }
     meF.lock.progress = scn.lock >= 1 ? 1 : scn.lock; meF.lock.locked = scn.lock >= 1;
     const w = dir(h + scn.warnAng, 0); meF.warn.missile = scn.warn > 0; meF.warn.dist = scn.warn; meF.warn.dir[0] = w[0]; meF.warn.dir[1] = w[1]; meF.warn.dir[2] = w[2];
     if (scn.gun && now - (frame.g || 0) > 100) { frame.g = now; snd.onEvent({ type: 'gunFired', owner: 0 }, 0); }

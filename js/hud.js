@@ -21,6 +21,11 @@
 // arrow at the edge toward an off-screen enemy, the gun lead pip (within 1.5 km), MISSILE warning (flash rate rises as the missile
 // closes) with a red arrow on a ring pointing at it, ammo (missiles, flares, gun rounds), my health, the enemy's health + name, score.
 // The fighters are the README records: me.s.pos / vel, me.hp / alive / missiles / flares / gunAmmo / lock / warn.
+//
+// PHASE 4 (modes): hud.setBanner(text|null) = a small line top-centre (under the score bar when there is one): "RING 4/16 · 0:42.3",
+// "WAVE 3 · KILLS 5". The text is written only when it changes. setFight also takes `enemies: []` (survival: the target box / arrow
+// follows the jet I'm locking, else the NEAREST live one; only that one gets an arrow) and tolerates a missing `enemy` and `score`
+// (race, tutorial: the enemy bar and the score line are hidden).
 
 import * as THREE from 'three';
 import { AB_DETENT, WORLD_FRAME } from './jetspec.js';
@@ -67,7 +72,12 @@ const CSS = `
 .fhud .fo{display:none}
 .fhud.fight .fo{display:block}
 .fhud.fight .fx{display:flex}
-.fhud.fight .hdg{top:100px}
+.fhud.fin .hdg{top:100px}
+.fhud .fban{position:absolute;left:50%;top:14px;transform:translateX(-50%);display:none;font-size:16px;font-weight:800;letter-spacing:2px;background:var(--panel);
+  padding:4px 16px;border-radius:12px;white-space:nowrap;font-variant-numeric:tabular-nums}
+.fhud.ban .fban{display:block}.fhud.fin .fban{top:92px}.fhud.cp.fin .fban{top:46px}
+.fhud.ban .hdg{top:52px}.fhud.ban.fin .hdg{top:134px}
+.fhud.cp .fban{border:1.5px solid rgba(190,255,210,.5);border-radius:6px;font-size:14px;padding:2px 12px}
 .fhud .ftop{position:absolute;left:50%;top:14px;transform:translateX(-50%);flex-direction:column;align-items:center;gap:6px}
 .fhud .fscore{font-size:20px;font-weight:800;letter-spacing:2px;background:var(--panel);padding:5px 18px;border-radius:12px;white-space:nowrap;font-variant-numeric:tabular-nums}
 .fhud .fen{display:flex;align-items:center;gap:10px;font-size:14px;letter-spacing:1px;background:var(--panel);padding:6px 12px;border-radius:12px;white-space:nowrap}
@@ -127,6 +137,7 @@ const CSS = `
 `;
 
 const V = new THREE.Vector3();
+const NONE = [], ONE = [null];   // setFight's target lists: no allocation per call
 const RAD = Math.PI / 180, TAU = Math.PI * 2;
 const FONT = '700 13px Rubik,ui-rounded,system-ui,sans-serif';
 const HDG = [], TAPE = [], PL = [];   // label tables, built once: no strings are made per frame
@@ -179,7 +190,7 @@ export function createHud(root) {
     <div class="fo pt arrw"><div class="tri"></div></div><div class="fo pt adist"></div>
     <div class="fo pt mring"></div><div class="fo pt arrw marrw"><div class="tri"></div></div>
     <div class="fo fx mwarn"><div class="mw">MISSILE</div><div class="mf">F — FLARES</div></div>
-    <div class="fo dmg"></div><div class="fo hitx"></div>`;
+    <div class="fo dmg"></div><div class="fo hitx"></div><div class="fban"></div>`;
   root.appendChild(el);
   const q = (s) => el.querySelector(s);
   const aimEl = q('.aim'), noseEl = q('.nose'), thrEl = q('.thr i'), warnEl = q('.warn'), edgeEl = q('.edge');
@@ -197,7 +208,8 @@ export function createHud(root) {
     arw: q('.arrw'), adist: q('.adist'), mring: q('.mring'), marw: q('.marrw'), mwarn: q('.mwarn'), mw: q('.mw'), dmg: q('.dmg'), hitx: q('.hitx'),
   };
   const FN = fightNodes;
-  const F = { on: false, me: null, enemy: null, combat: null, score: null };
+  const F = { on: false, me: null, enemy: null, list: NONE, combat: null, score: null, fi: false };
+  const banEl = q('.fban');
   const fl = {   // last written values (text / classes / positions), so nothing is touched twice
     sc: -1, name: '', enHp: -1, meHp: -1, mis: -1, fls: -1, gun: -1, tdist: -2, prog: -1, lk: null, tvis: null, lvis: null, avis: null, adist: -2,
     wvis: null, woff: null, wbk: null, mrr: -1, mrx: NaN, mry: NaN, now: 0, wphase: 0,
@@ -371,11 +383,14 @@ export function createHud(root) {
 
     // score, names, health, ammo
     const sc = F.score;
+    const fi = !!(sc || en);   // is there fight info up top (score line / enemy bar)? the banner and the heading box make room
+    if (fi !== F.fi) { F.fi = fi; el.classList.toggle('fin', fi); }
     if (sc) {
       const key = sc.round * 10000 + sc.me * 100 + sc.enemy;
       if (key !== fl.sc) { fl.sc = key; FN.score.textContent = `ROUND ${sc.round} · YOU ${sc.me} – ${sc.enemy} ${en && !en.isAI ? 'ENEMY' : 'AI'}`; }
     }
     FN.score.style.display = sc ? '' : 'none';
+    if (!!F.noWeapons !== fl.nw) { fl.nw = !!F.noWeapons; FN.ammo.style.display = fl.nw ? 'none' : ''; }   // e.g. the ring race
     const nm = en ? (en.isAI ? `${en.name} (AI)` : en.name) : '';
     if (nm !== fl.name) { fl.name = nm; FN.name.textContent = nm; }
     FN.enBar.parentElement.style.display = en ? '' : 'none';
@@ -386,8 +401,19 @@ export function createHud(root) {
 
     // the enemy: target box on screen, else an arrow at the edge
     let showBox = false, showArw = false, showLead = false;
-    if (en && en.alive !== false && meAlive) {
-      const ex = en.s.pos[0], ey = en.s.pos[1], ez = en.s.pos[2];
+    let tg = null;   // the target: the jet I'm locking, else the nearest live enemy
+    if (meAlive) {
+      let best = 1e30;
+      for (let i = 0; i < F.list.length; i++) {
+        const c = F.list[i];
+        if (!c || c.alive === false) continue;
+        if (me.lock && me.lock.target === c.id && me.lock.target >= 0) { tg = c; break; }
+        const d = (c.s.pos[0] - pose.pos[0]) ** 2 + (c.s.pos[1] - pose.pos[1]) ** 2 + (c.s.pos[2] - pose.pos[2]) ** 2;
+        if (d < best) { best = d; tg = c; }
+      }
+    }
+    if (tg) {
+      const ex = tg.s.pos[0], ey = tg.s.pos[1], ez = tg.s.pos[2];
       const dist = Math.hypot(ex - pose.pos[0], ey - pose.pos[1], ez - pose.pos[2]);
       const front = toScreen(camera, ex, ey, ez, W, H), sx = ARW.x, sy = ARW.y, ox = CX, oy = CY;
       const inside = front && sx > R.x + 44 && sx < R.x + R.w - 44 && sy > R.y + 44 && sy < R.y + R.h - 44;
@@ -395,7 +421,7 @@ export function createHud(root) {
       if (inside) {
         showBox = true; mv(FN.tbox, sx, sy, 0);
         if (key !== fl.tdist) { fl.tdist = key; FN.tdist.textContent = kmText(key); }
-        const lk = me.lock, prog = lk && !lk.locked ? clamp01(lk.progress) : 0, locked = !!(lk && lk.locked);
+        const lk = me.lock && (me.lock.target === tg.id || me.lock.target < 0) ? me.lock : null, prog = lk && !lk.locked ? clamp01(lk.progress) : 0, locked = !!(lk && lk.locked);
         if (locked !== fl.lk) { fl.lk = locked; FN.tbox.classList.toggle('lk', locked); }
         const pq = Math.round(prog * 50);
         if (pq !== fl.prog) { fl.prog = pq; FN.ring.style.opacity = pq ? '1' : '0'; FN.ring.style.transform = `scale(${(2.6 - 1.6 * pq / 50).toFixed(3)})`; }
@@ -412,7 +438,7 @@ export function createHud(root) {
       if (dist < 1500 && front) {
         let t = dist / 1000, px = ex, py = ey, pz = ez;
         for (let i = 0; i < 3; i++) {
-          px = ex + en.s.vel[0] * t; py = ey + en.s.vel[1] * t; pz = ez + en.s.vel[2] * t;
+          px = ex + tg.s.vel[0] * t; py = ey + tg.s.vel[1] * t; pz = ez + tg.s.vel[2] * t;
           t = Math.hypot(px - pose.pos[0], py - pose.pos[1], pz - pose.pos[2]) / 1000;
         }
         if (toScreen(camera, px, py, pz, W, H) && ARW.x > R.x + 20 && ARW.x < R.x + R.w - 20 && ARW.y > R.y + 20 && ARW.y < R.y + R.h - 20) { showLead = true; mv(FN.lead, ARW.x, ARW.y, 0); }
@@ -507,8 +533,18 @@ export function createHud(root) {
    */
   function setFight(o) {
     const on = !!(o && o.me);
-    if (on) { F.me = o.me; F.enemy = o.enemy || null; F.combat = o.combat || null; F.score = o.score || null; } else F.me = F.enemy = F.combat = F.score = null;
-    if (on !== F.on) { F.on = on; el.classList.toggle('fight', on); }
+    if (on) {
+      F.me = o.me; F.enemy = o.enemy || null; F.combat = o.combat || null; F.score = o.score || null; F.noWeapons = !!o.noWeapons;
+      F.list = o.enemies && o.enemies.length ? o.enemies : F.enemy ? (ONE[0] = F.enemy, ONE) : NONE;   // `enemies` wins, else the single enemy
+    } else { F.me = F.enemy = F.combat = F.score = null; F.list = NONE; ONE[0] = null; }
+    if (on !== F.on) { F.on = on; el.classList.toggle('fight', on); if (!on && F.fi) { F.fi = false; el.classList.remove('fin'); } }
   }
-  return { update, setMode, setFight, onEvent, setLadder(on) { ladder = !!on; }, setEnv(e) { env = e; }, el };
+  /** A small line at the top centre for mode info ("RING 4/16 · 0:42.3"); null / '' hides it. Cheap to call every frame. */
+  let banText = null;
+  function setBanner(t) {
+    const v = t || null;
+    if (v === banText) return;
+    banText = v; banEl.textContent = v || ''; el.classList.toggle('ban', !!v);
+  }
+  return { update, setMode, setFight, setBanner, onEvent, setLadder(on) { ladder = !!on; }, setEnv(e) { env = e; }, el };
 }
