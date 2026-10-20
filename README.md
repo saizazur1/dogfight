@@ -141,3 +141,35 @@ hud.setFight({ me, enemy, combat, score: { me: 0, enemy: 0, round: 1 } });   // 
 sound.onEvent(e, meId);  // lock growl / lock tone / missile warning / launch / gun / hits
 cards.show('round'|'roundWin'|'roundLose'|'win'|'lose', { text, sub })   // big centred round cards, hide()
 ```
+
+## Modes contract (after Phase 3)
+
+`js/game.js` owns the session: engine loop glue, the fighter pool (up to 8 jets), views, HUD, sound, effects, combat, cards.
+A **mode** is a small controller plugged into it. `main.js` only boots and calls `createGame(...)`.
+
+```js
+// game.js gives every mode this object:
+game = {
+  world, scene, camera, env, combat, controls, hud, cards, sound, wfx, params, profile,  // profile = menu.profile {name, color, skill}
+  me,                                   // fighters[0], the player (always present)
+  fighters,                             // live list (me first)
+  spawnAI({ pos, heading, speed, skill, name, color }) -> fighter,   // pooled; joins combat; returns the fighter
+  despawn(fighter),                     // returns it to the pool (hidden, out of combat)
+  respawnMe({ pos, heading, speed }),   // fresh JetState + full hp/ammo for the player
+  safeSpawn(i, n) -> { pos, heading, speed },   // n well-spread, terrain-safe starts in the play area (i-th)
+  setBanner(text|null),                 // small persistent top-centre line (mode info: timer, wave, rings)
+  finish({ title, sub, won }),          // ends the mode: big card, "Space: again · Esc: menu"
+  t,                                    // sim time
+}
+// a mode:
+createXMode(game) -> {
+  id: 'duel'|'survival'|'race'|'tutorial', title,
+  start(),               // called on PLAY (and on "again")
+  step(dt),              // every 120 Hz step, AFTER stepJet + combat.step
+  frame(frameDt),        // every display frame (visuals, HUD bits)
+  onEvent(e),            // combat events (kill, missileHit, lockOn, ...)
+  stop(),                // leaving the mode: remove its objects/AIs
+}
+```
+
+Rules: modes never touch the engine or renderer; they create Three.js objects only under their own `THREE.Group` added to `game.scene` and removed in `stop()`. AI fighters are driven by `game` (it calls `ai.think` for every AI fighter, targeting `fighter.target` — default `game.me`). Everything per-step is allocation-free.
