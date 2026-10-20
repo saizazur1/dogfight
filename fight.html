@@ -1,0 +1,196 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fight Bench</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #0b1018; overflow: hidden; }
+  canvas { display: block; width: 100vw; height: 100vh; }
+  #info { position: fixed; left: 10px; top: 8px; color: #fff; font: 600 13px/1.45 ui-monospace, Menlo, monospace; text-shadow: 0 1px 2px #000; white-space: pre; pointer-events: none; }
+  #log { position: fixed; right: 10px; top: 8px; color: #ffe9b0; font: 12px/1.4 ui-monospace, Menlo, monospace; text-shadow: 0 1px 2px #000; white-space: pre; text-align: right; pointer-events: none; }
+  #msg { position: fixed; left: 50%; bottom: 60px; transform: translateX(-50%); color: #fff; font: 800 18px system-ui, sans-serif; text-shadow: 0 1px 3px #000; }
+  #credit { position: fixed; right: 8px; bottom: 6px; color: #fff; opacity: .6; font: 11px system-ui, sans-serif; }
+</style>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.186.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.186.0/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="info"></div><div id="log"></div><div id="msg">loading...</div><div id="credit"></div>
+<script type="module">
+// fight.html -- the COMBAT + AI lane's bench: two real jets (buildJet + flight.js), combat.js and ai.js at a fixed 120 Hz,
+// simple stand-in visuals for missiles (sphere + trail), tracers and flares (the effects lane makes the real ones). Params:
+//   ?mode=pvai (default: you vs the AI; mouse aim, left button gun, right / Space missile, F flares) | aivai (AI vs AI)
+//   ?skill=easy|medium|hard (the AI; aivai: both, or ?skill2= for jet 1)   ?seed=<n>   ?flat=1 (simple ground)
+//   ?ff=<s> fast-forward the fight this many seconds at load (deterministic; for screenshots)   ?hold=1 then stop the sim there
+//   ?cam=0|1 (aivai: whose jet)
+import * as THREE from 'three';
+import { createJet, stepJet, jetModelState } from './js/flight.js';
+import { createCombat, RAIL_ORDER } from './js/combat.js';
+import { createAI } from './js/ai.js';
+import { createControls } from './js/controls.js';
+import { createChaseCam } from './js/chasecam.js';
+import { buildJet } from './js/jetmodel.js';
+import { poseMatrix } from './js/jetspec.js';
+
+const P = new URLSearchParams(location.search);
+const DT = 1 / 120, MODE = P.get('mode') === 'aivai' ? 'aivai' : 'pvai', SEED = +(P.get('seed') || 7);
+const SKILL = P.get('skill') || 'medium', SKILL2 = P.get('skill2') || SKILL, CAMI = +(P.get('cam') || 0);
+const $ = (id) => document.getElementById(id);
+const canvas = $('c');
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: false, logarithmicDepthBuffer: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 1.5));
+renderer.setSize(innerWidth, innerHeight, false);
+renderer.toneMapping = THREE.AgXToneMapping;
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(68, innerWidth / innerHeight, 0.5, 4e5);
+addEventListener('resize', () => { renderer.setSize(innerWidth, innerHeight, false); camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix(); });
+
+// ---------------------------------------------------------------- the world (flight.html's, or ?flat=1)
+function flatWorld() {
+  const h = (x, z) => 600 + 900 * Math.max(0, Math.sin(x / 2300) * Math.cos(z / 2900)) ** 1.5 + 120 * Math.sin(x / 700 + z / 900);
+  const N = 256, S = 40000, geo = new THREE.PlaneGeometry(S, S, N, N); geo.rotateX(-Math.PI / 2);
+  const p = geo.attributes.position;
+  for (let i = 0; i < p.count; i++) p.setY(i, h(p.getX(i), p.getZ(i)));
+  geo.computeVertexNormals();
+  scene.add(new THREE.Mesh(geo, new THREE.MeshStandardMaterial({ color: 0x8a8f85, roughness: 1, flatShading: true })), new THREE.HemisphereLight(0xbfd8ff, 0x55504a, 1.2));
+  const sun = new THREE.DirectionalLight(0xffe2b8, 3); sun.position.set(-3, 1.2, 2); scene.add(sun);
+  scene.background = new THREE.Color(0x9cc3e6); scene.fog = new THREE.Fog(0x9cc3e6, 4000, 30000);
+  return { terrainHeightAt: h, exposure: 1, update() {}, applyEnv() {}, credit: null, spawn: { pos: [0, 2200, 6000], heading: 0, speed: 220 } };
+}
+let world;
+if (P.get('flat') === '1') world = flatWorld();
+else {
+  try { const { buildJetWorld } = await import('./js/jetworld.js'); world = await buildJetWorld(scene, renderer, { seed: 7 }); }
+  catch (e) { console.warn('[fight] jetworld failed, using ?flat=1 ground:', e); world = flatWorld(); }
+}
+renderer.toneMappingExposure = world.exposure ?? 1;
+if (world.credit) $('credit').textContent = world.credit;
+const th = world.terrainHeightAt;
+const env = { terrainHeightAt: th, playArea: world.playArea ?? { cx: 0, cz: 0, half: 15000, ceiling: 6000 } };
+
+// ---------------------------------------------------------------- the fight
+const log = [];
+const combat = createCombat({ terrainHeightAt: th, seed: SEED, onEvent: (e) => { if (e.type !== 'gunFired' && e.type !== 'flare') { log.push(`${e.t.toFixed(1)} ${e.type} ${JSON.stringify(e, (k, v) => (k === 'type' || k === 't' ? undefined : typeof v === 'number' ? Math.round(v * 10) / 10 : v))}`); if (log.length > 8) log.shift(); } } });
+const controls = MODE === 'pvai' ? createControls({ canvas }) : null;
+const names = ['Falcon', 'Viper'], fighters = [], ais = [], jets = [];
+for (let id = 0; id < 2; id++) {
+  const f = { id, name: names[id], color: id ? '#2b62cf' : '#c8362c', isAI: MODE === 'aivai' || id === 1, s: null,
+    ctl: id === 0 && controls ? controls.ctl : { aim: [0, 0, -1], throttle: 0.84, ab: false, gun: false, missile: false, flare: false } };
+  fighters.push(f);
+  const jet = buildJet(id, {}); jet.group.matrixAutoUpdate = false; scene.add(jet.group); world.applyEnv?.(jet.group); jets.push(jet);
+}
+if (!scene.children.some((o) => o.isLight)) scene.add(new THREE.HemisphereLight(0xffffff, 0x444444, 2));
+let round = 0, roundOver = 0, score = [0, 0];
+function spawnRound() {
+  const sp = world.spawn ?? { pos: [0, 2000, 0], heading: 0, speed: 220 }, h = sp.heading, sx = Math.sin(h), sz = -Math.cos(h);
+  const far = [sp.pos[0] + sx * 7000, 0, sp.pos[2] + sz * 7000];
+  far[1] = Math.max(sp.pos[1], th(far[0], far[2]) + 700);
+  const starts = [{ pos: [sp.pos[0], Math.max(sp.pos[1], th(sp.pos[0], sp.pos[2]) + 500), sp.pos[2]], heading: h, speed: 230 }, { pos: far, heading: h + Math.PI, speed: 230 }];
+  fighters.forEach((f, i) => {
+    f.s = createJet(starts[i]); combat.add(f); combat.reset(f);
+    f.prev = { pos: f.s.pos.slice(), q: f.s.q.slice() };
+    if (f.isAI) ais[i] = createAI(f, { skill: i ? SKILL2 : SKILL, env, combat, seed: SEED * 31 + round * 7 + i });
+  });
+  if (controls) { controls.reset(h, 0); controls.ctl.throttle = 0.84; }
+  cam.snap(); round++; roundOver = 0;
+}
+const cam = createChaseCam(camera); cam.setEnv(env);
+spawnRound();
+
+function simStep() {
+  for (let i = 0; i < 2; i++) { const f = fighters[i]; f.prev.pos.splice(0, 3, ...f.s.pos); f.prev.q.splice(0, 4, ...f.s.q); }   // bench: allocations fine here
+  for (let i = 0; i < 2; i++) if (ais[i]) ais[i].think(DT, fighters[1 - i]);
+  for (const f of fighters) stepJet(f.s, f.ctl, DT, env);
+  combat.step(DT);
+  controls?.consumeEdges?.();
+  if (!roundOver && fighters.some((f) => !f.alive)) { roundOver = combat.t; const w = fighters.findIndex((f) => f.alive); if (w >= 0) score[w]++; }
+  if (roundOver && combat.t - roundOver > 5) spawnRound();
+}
+const FF = +(P.get('ff') || 0), HOLD = P.get('hold') === '1';
+for (let i = 0; i < FF * 120; i++) simStep();
+
+// ---------------------------------------------------------------- stand-in visuals
+const mGeo = new THREE.SphereGeometry(1.6, 10, 8), mMat = new THREE.MeshBasicMaterial({ color: 0xffb040 });
+const TRAIL = 90, mVis = combat.missiles.map(() => {
+  const ball = new THREE.Mesh(mGeo, mMat), pos = new Float32Array(TRAIL * 3), g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  const line = new THREE.Line(g, new THREE.LineBasicMaterial({ color: 0xdddddd, transparent: true, opacity: 0.7 }));
+  line.frustumCulled = false; ball.visible = line.visible = false; scene.add(ball, line);
+  return { ball, line, pos, id: -1, n: 0 };
+});
+const NB = combat.bullets.length, bPos = new Float32Array(NB * 6), bGeo = new THREE.BufferGeometry();
+bGeo.setAttribute('position', new THREE.BufferAttribute(bPos, 3));
+const tracers = new THREE.LineSegments(bGeo, new THREE.LineBasicMaterial({ color: 0xfff1a0 })); tracers.frustumCulled = false; scene.add(tracers);
+const NF = combat.flares.length, fPos = new Float32Array(NF * 3), fGeo = new THREE.BufferGeometry();
+fGeo.setAttribute('position', new THREE.BufferAttribute(fPos, 3));
+const flarePts = new THREE.Points(fGeo, new THREE.PointsMaterial({ color: 0xffffff, size: 6, sizeAttenuation: true })); flarePts.frustumCulled = false; scene.add(flarePts);
+function updateWeapons() {
+  combat.missiles.forEach((m, i) => {
+    const v = mVis[i];
+    if (m.alive && v.id !== m.id) { v.id = m.id; v.n = 0; }
+    v.ball.visible = m.alive; v.line.visible = m.alive || v.n > 0;
+    if (m.alive) {
+      v.ball.position.fromArray(m.pos);
+      v.pos.copyWithin(3, 0, (TRAIL - 1) * 3); v.pos[0] = m.pos[0]; v.pos[1] = m.pos[1]; v.pos[2] = m.pos[2];
+      v.n = Math.min(TRAIL, v.n + 1);
+    } else if (v.n > 0) v.n = Math.max(0, v.n - 2);
+    v.line.geometry.setDrawRange(0, v.n); v.line.geometry.attributes.position.needsUpdate = true;
+  });
+  let k = 0;
+  for (const b of combat.bullets) if (b.alive) { bPos.set(b.pos, k); bPos[k + 3] = b.pos[0] - b.vel[0] * 0.03; bPos[k + 4] = b.pos[1] - b.vel[1] * 0.03; bPos[k + 5] = b.pos[2] - b.vel[2] * 0.03; k += 6; }
+  bGeo.setDrawRange(0, k / 3); bGeo.attributes.position.needsUpdate = true;
+  k = 0;
+  for (const f of combat.flares) if (f.alive && f.burn > 0.05) { fPos.set(f.pos, k); k += 3; }
+  fGeo.setDrawRange(0, k / 3); fGeo.attributes.position.needsUpdate = true;
+}
+
+// ---------------------------------------------------------------- the loop: fixed 120 Hz, interpolated rendering
+const ms = fighters.map(() => ({ rails: [1, 1, 1, 1] })), mat = new Array(16), qa = new THREE.Quaternion(), qb = new THREE.Quaternion();
+const poses = fighters.map(() => ({ pos: [0, 0, 0], q: [0, 0, 0, 1] })), camAim = [0, 0, -1];
+let acc = 0, last = performance.now();
+$('msg').textContent = MODE === 'pvai' ? 'click to fly | mouse aim, left button gun, right / Space missile, F flares' : `AI vs AI (${SKILL} vs ${SKILL2})`;
+function frame(now) {
+  const fdt = Math.min((now - last) / 1000, 0.1); last = now;
+  if (controls) controls.update(fdt, fighters[0].s);
+  if (!HOLD) acc += fdt;
+  while (acc >= DT) { acc -= DT; simStep(); }
+  const a = acc / DT;
+  fighters.forEach((f, i) => {
+    const p = poses[i];
+    for (let j = 0; j < 3; j++) p.pos[j] = f.prev.pos[j] + (f.s.pos[j] - f.prev.pos[j]) * a;
+    qa.fromArray(f.prev.q); qb.fromArray(f.s.q); qa.slerp(qb, a); qa.toArray(p.q);
+    const jet = jets[i]; jet.group.matrix.fromArray(poseMatrix(p.pos, p.q, mat)); jet.group.matrixWorldNeedsUpdate = true;
+    jet.group.visible = !f.s.crashed;
+    const st = jetModelState(f.s, ms[i]);
+    for (let r = 0; r < 4; r++) st.rails[RAIL_ORDER[r]] = r < 4 - f.missiles ? 0 : 1;
+    jet.setState(st);
+  });
+  // camera: the player's aim (pvai), or the followed AI jet's path turned a third of the way toward its enemy (aivai)
+  const me = fighters[MODE === 'pvai' ? 0 : CAMI], foe = fighters[1 - me.id];
+  if (MODE === 'pvai') cam.update(fdt, poses[0], me.ctl.aim, me.s, controls.look);
+  else {
+    const v = me.s.vel, sp = Math.hypot(v[0], v[1], v[2]) || 1, d = [foe.s.pos[0] - me.s.pos[0], foe.s.pos[1] - me.s.pos[1], foe.s.pos[2] - me.s.pos[2]], dl = Math.hypot(...d) || 1;
+    for (let j = 0; j < 3; j++) camAim[j] = v[j] / sp * 0.65 + d[j] / dl * 0.35;
+    const l = Math.hypot(...camAim); for (let j = 0; j < 3; j++) camAim[j] /= l;
+    cam.update(fdt, poses[me.id], camAim, me.s);
+  }
+  world.update(combat.t, camera);
+  updateWeapons();
+  const line = (f, ai) => `${f.name.padEnd(7)} hp ${'#'.repeat(Math.round(f.hp * 20)).padEnd(20, '.')} ${f.alive ? '' : 'DOWN'}  ${Math.round(f.s.speed)} m/s  agl ${Math.round(f.s.pos[1] - th(f.s.pos[0], f.s.pos[2]))}\n`
+    + `        M ${f.missiles}  flares ${f.flares}  gun ${f.gunAmmo}  lock ${f.lock.locked ? 'LOCK' : f.lock.target >= 0 ? `${Math.round(f.lock.progress * 100)}%` : '-'}  ${f.warn.missile ? `MISSILE ${Math.round(f.warn.dist)} m` : ''}  ${ai ? ai.state : 'you'}`;
+  $('info').textContent = `round ${round}  score ${score[0]} - ${score[1]}  t ${combat.t.toFixed(1)} s  range ${Math.round(Math.hypot(foe.s.pos[0] - me.s.pos[0], foe.s.pos[1] - me.s.pos[1], foe.s.pos[2] - me.s.pos[2]))} m\n${line(fighters[0], ais[0])}\n${line(fighters[1], ais[1])}`;
+  $('log').textContent = log.join('\n');
+  renderer.render(scene, camera);
+  requestAnimationFrame(frame);
+}
+window.__fight = { combat, fighters, ais, env };
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

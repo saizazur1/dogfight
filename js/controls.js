@@ -10,8 +10,15 @@
 //
 // Keys: W / S throttle (ramps; W stops at the afterburner detent, keep holding past it for afterburner), Shift afterburner
 // hold, A / D roll, Q / E yaw, Arrow up / down pitch, B air brake (hold), C free look (hold: the aim freezes, the mouse
-// orbits the camera), V view (chase | cockpit). Space is left free. Esc releases the pointer lock (the browser's own).
-// Gamepad (standard mapping, if one is connected): left stick moves the aim, RT / LT throttle up / down, A afterburner.
+// orbits the camera), V view (chase | cockpit), F flares. Esc releases the pointer lock (the browser's own).
+// Gamepad (standard mapping, if one is connected): left stick moves the aim, RT / LT throttle up / down, A afterburner,
+// RB gun (hold), LB missile, B flares.
+//
+// PHASE 3 weapons: ctl.gun is HELD state (left mouse button while the pointer is locked, or RB). ctl.missile / ctl.flare are EDGES:
+// a right click / Space / LB (flare: F / B) sets them true and they STAY true until the game calls controls.consumeEdges(), so a press
+// is never lost between display frames and never fires twice. Call consumeEdges() once after EVERY sim step:
+//     step(dt) { ...pilots write ctl...; stepJet(...); combat.step(dt); controls.consumeEdges(); }
+// (the first step after a press sees the edge, the clearing happens right after it; later steps in the same frame see false).
 
 import { AB_DETENT } from './jetspec.js';
 
@@ -28,7 +35,8 @@ const save = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } cat
  * Keyboard + mouse-aim + pointer-lock input. Allocation-free per frame.
  * @param {{canvas: HTMLElement}} o  the element clicks lock the pointer to
  * @returns {{
- *   ctl: {aim:number[], pitch:number, roll:number, yaw:number, throttle:number, ab:boolean, brake:boolean},
+ *   ctl: {aim:number[], pitch:number, roll:number, yaw:number, throttle:number, ab:boolean, brake:boolean, gun:boolean, missile:boolean, flare:boolean},
+ *   consumeEdges: () => void,   // clears ctl.missile / ctl.flare: call after each sim step
  *   update: (frameDt:number, s?:import('./flight.js').JetState) => void,
  *   reset: (heading:number, pitch?:number) => void,
  *   view: 'chase'|'cockpit', locked: boolean, onLockChange: ((locked:boolean)=>void)|null,
@@ -38,7 +46,8 @@ const save = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } cat
  *   ctl is the object to pass to stepJet (updated live). look = the free-look orbit (rad) for the chase camera.
  */
 export function createControls({ canvas }) {
-  const ctl = { aim: [0, 0, -1], pitch: 0, roll: 0, yaw: 0, throttle: 0.7, ab: false, brake: false };
+  const ctl = { aim: [0, 0, -1], pitch: 0, roll: 0, yaw: 0, throttle: 0.7, ab: false, brake: false, gun: false, missile: false, flare: false };
+  let mouseGun = false, padGun = false, padMissile = false, padFlare = false;   // last gamepad button states, for edge detection
   const keys = Object.create(null);
   let aimYaw = 0, aimPitch = 0, detentT = 0;
   const api = {
@@ -50,6 +59,8 @@ export function createControls({ canvas }) {
     setInvertY(b) { api.invertY = !!b; save(INV_KEY, api.invertY); },
     reset(heading, pitch = 0) { aimYaw = heading; aimPitch = clamp(pitch, -PITCH_MAX, PITCH_MAX); api.look.yaw = api.look.pitch = 0; writeAim(); },
     update, dispose,
+    /** clears the one-step edges (ctl.missile, ctl.flare): the game calls it after every sim step */
+    consumeEdges() { ctl.missile = false; ctl.flare = false; },
   };
 
   function writeAim() {
@@ -80,6 +91,7 @@ export function createControls({ canvas }) {
   };
   const onLock = () => {
     api.locked = document.pointerLockElement === canvas;
+    if (!api.locked) releaseButtons();   // a held trigger must not stay stuck when the lock is lost (Esc, menu)
     if (api.onLockChange) api.onLockChange(api.locked);
   };
   const GAME_KEYS = new Set(['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight']);
@@ -87,15 +99,31 @@ export function createControls({ canvas }) {
     const down = e.type === 'keydown';
     if (GAME_KEYS.has(e.code)) e.preventDefault();
     if (down && e.code === 'KeyV' && !e.repeat) api.view = api.view === 'chase' ? 'cockpit' : 'chase';
+    if (e.code === 'Space' && api.locked) e.preventDefault();   // no page scroll / button press while flying
+    if (down && !e.repeat && api.locked) {
+      if (e.code === 'Space') ctl.missile = true; else if (e.code === 'KeyF') ctl.flare = true;
+    }
     keys[e.code] = down;
   };
-  const onBlur = () => { for (const k in keys) keys[k] = false; };
+  // mouse buttons only count while the pointer is locked (the first click just locks it): left = gun (held), right = missile
+  const onMouse = (e) => {
+    if (!api.locked) return;
+    const down = e.type === 'mousedown';
+    if (e.button === 0) ctl.gun = mouseGun = down; else if (e.button === 2 && down) ctl.missile = true;
+    e.preventDefault();
+  };
+  const onMenu = (e) => { if (api.locked) e.preventDefault(); };   // no context menu on right click while flying
+  const releaseButtons = () => { mouseGun = false; ctl.gun = padGun; };
+  const onBlur = () => { for (const k in keys) keys[k] = false; releaseButtons(); };
   canvas.addEventListener('click', onClick);
   document.addEventListener('mousemove', onMove);
   document.addEventListener('pointerlockchange', onLock);
   window.addEventListener('keydown', onKey);
   window.addEventListener('keyup', onKey);
   window.addEventListener('blur', onBlur);
+  document.addEventListener('mousedown', onMouse);
+  document.addEventListener('mouseup', onMouse);
+  document.addEventListener('contextmenu', onMenu);
 
   /**
    * Once per display frame: keyboard ramps, gamepad, free look, and the aim kept where the jet can follow it.
@@ -116,6 +144,11 @@ export function createControls({ canvas }) {
       aimPitch = clamp(aimPitch - (api.invertY ? -1 : 1) * dz(gp.axes[1]) * 90 * D2R * dt, -PITCH_MAX, PITCH_MAX);
       thrUp = Math.max(thrUp, gp.buttons[7] ? gp.buttons[7].value : 0); thrDn = Math.max(thrDn, gp.buttons[6] ? gp.buttons[6].value : 0);
       ab = ab || !!(gp.buttons[0] && gp.buttons[0].pressed);
+      const pr = (i) => !!(gp.buttons[i] && gp.buttons[i].pressed);
+      padGun = pr(5); ctl.gun = mouseGun || padGun;   // RB held, or the left mouse button
+      if (pr(4) && !padMissile) ctl.missile = true;   // LB: edge
+      if (pr(1) && !padFlare) ctl.flare = true;       // B: edge
+      padMissile = pr(4); padFlare = pr(1);
     }
 
     // throttle: W ramps up to the detent and stops; held there DETENT_HOLD s more it carries on into afterburner
@@ -150,6 +183,9 @@ export function createControls({ canvas }) {
     window.removeEventListener('keydown', onKey);
     window.removeEventListener('keyup', onKey);
     window.removeEventListener('blur', onBlur);
+    document.removeEventListener('mousedown', onMouse);
+    document.removeEventListener('mouseup', onMouse);
+    document.removeEventListener('contextmenu', onMenu);
   }
   writeAim();
   return api;

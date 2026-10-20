@@ -95,7 +95,7 @@ export function createMenu(root, opts = {}) {
       <div><div class="lbl">Jet colour</div>${radios('color', COLORS, profile.color, 'sw')}</div>
       <div><div class="lbl">AI skill</div>${radios('skill', SKILLS, profile.skill, 'seg')}</div>
       <button class="big" data-a="play">PLAY</button>
-      <div class="keys">Mouse aim · W/S throttle · Shift afterburner · V view · Esc pause</div>
+      <div class="keys">Mouse aim · Click gun · Right-click / Space missile · F flares · W/S throttle · Shift afterburner · V view</div>
     </div>
     <button class="lnk" data-a="settings">Settings</button>
   </section>

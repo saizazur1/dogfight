@@ -1,6 +1,7 @@
 {
   "version": "0.0.1",
   "configurations": [
-    { "name": "dogfight", "runtimeExecutable": "python3", "runtimeArgs": ["-m", "http.server", "8320", "--bind", "127.0.0.1"], "port": 8320 }
+    { "name": "dogfight", "runtimeExecutable": "python3", "runtimeArgs": ["-m", "http.server", "8320", "--bind", "127.0.0.1"], "port": 8320 },
+    { "name": "dogfight-running", "url": "http://127.0.0.1:8320", "port": 8320 }
   ]
 }

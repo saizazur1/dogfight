@@ -24,13 +24,17 @@ import * as THREE from 'three';
 import { createMenu } from './js/menu.js';
 import { createHud } from './js/hud.js';
 import { createSound } from './js/sound.js';
+import { createCards } from './js/cards.js';
 import { quatFromEuler } from './js/jetspec.js';
 
 // Bench: ?mode=chase|cockpit shows the HUD with a fake jet; ?screen=start|pause|settings shows the menu; ?static=1 freezes the motion.
+// PHASE 3: ?fight=1 (with mode, default chase) adds a fake me + enemy: &enemy=on|near|left|right|behind|up  &lock=0..1 (1 = locked)
+//   &warn=<missile distance m>&warnAng=<deg from my nose>  &card=round|roundWin|roundLose|win|lose|count
 const P = new URLSearchParams(location.search);
-const mode = P.get('mode'), screen = P.get('screen') || (mode ? 'none' : 'start');
+const fightOn = P.has('fight'), mode = P.get('mode') || (fightOn ? 'chase' : null), screen = P.get('screen') || (mode ? 'none' : 'start');
 const log = [];   // read by tools: window.__bench.log
 const snd = createSound();
+const cards = createCards(document.body);
 const menu = createMenu(document.getElementById('menu'), {
   onPlay: (p, s) => { log.push(['play', p.name, p.color, p.skill]); snd.start(); snd.setVolume(s.volume); menu.show('none'); },
   onResume: () => { log.push('resume'); menu.show('none'); }, onQuit: () => log.push('quit'), onSettings: () => log.push('settings'),
@@ -46,6 +50,18 @@ const fake = { speed: 210, throttle: 0.75, ab: 0, gLoad: 1.4, brake: 0, crashed:
 const pose = { pos: [0, 3600, 0], q: [0, 0, 0, 1] }, aim = [0, 0, -1];
 const flipY = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), Math.PI);   // camera looks down -z, the jet's nose is +z
 const dir = (h, p) => [Math.sin(h) * Math.cos(p), Math.sin(p), -Math.cos(h) * Math.cos(p)];
+
+// ---- fake fighters for ?fight=1 (README fighter records)
+const fo = (id, name, isAI) => ({ id, name, isAI, s: { pos: [0, 0, 0], vel: [0, 0, 0] }, hp: 1, alive: true, missiles: 4, flares: 3, gunAmmo: 400,
+  lock: { target: -1, progress: 0, locked: false }, warn: { missile: false, dir: [0, 0, -1], dist: 0 } });
+const meF = fo(0, 'Falcon 427', false), enF = fo(1, 'Viper 21', true), combatF = { missiles: [], bullets: [], flares: [] };
+Object.assign(meF, { hp: 0.8, missiles: 3, flares: 2, gunAmmo: 312 }); enF.hp = 0.6;
+const scoreF = { me: 1, enemy: 0, round: 2 };
+const SCN = { on: [0.04, 0.03, 2400], near: [0.03, 0.02, 800], left: [-1.1, 0, 2600], right: [1.2, 0.1, 1500], behind: [3.0, 0, 900], up: [0.1, 0.9, 1800] };
+const scn = { k: P.get('enemy') || 'on', lock: +(P.get('lock') || 0), warn: +(P.get('warn') || 0), warnAng: +(P.get('warnAng') || 150) * Math.PI / 180, gun: false };
+if (fightOn) hud.setFight({ me: meF, enemy: enF, combat: combatF, score: scoreF });
+if (fightOn) snd.setFight({ me: meF, enemy: enF, combat: combatF });
+if (P.get('card')) cards.show(P.get('card'), { ms: 0, text: P.get('card') === 'count' ? '3' : undefined });
 let view = mode === 'chase' ? 'chase' : 'cockpit', t0 = performance.now();
 let hudOn = !!mode, ladder = false;
 function frame(now) {
@@ -59,6 +75,13 @@ function frame(now) {
   const ro = document.getElementById('rectOutline');
   if (hudOn && view === 'cockpit') { Object.assign(ro.style, { display: 'block', left: rect.x + 'px', top: rect.y + 'px', width: rect.w + 'px', height: rect.h + 'px' }); } else ro.style.display = 'none';
   document.getElementById('hud').style.display = hudOn ? '' : 'none';
+  if (fightOn) {
+    const [dh, dp, dist] = SCN[scn.k], d = dir(h + dh, p + dp), ev = dir(h + dh + 1.2, 0);
+    for (let i = 0; i < 3; i++) { enF.s.pos[i] = pose.pos[i] + d[i] * dist; enF.s.vel[i] = ev[i] * 240; meF.s.pos[i] = pose.pos[i]; meF.s.vel[i] = fake.vel[i]; }
+    meF.lock.progress = scn.lock >= 1 ? 1 : scn.lock; meF.lock.locked = scn.lock >= 1;
+    const w = dir(h + scn.warnAng, 0); meF.warn.missile = scn.warn > 0; meF.warn.dist = scn.warn; meF.warn.dir[0] = w[0]; meF.warn.dir[1] = w[1]; meF.warn.dir[2] = w[2];
+    if (scn.gun && now - (frame.g || 0) > 100) { frame.g = now; snd.onEvent({ type: 'gunFired', owner: 0 }, 0); }
+  }
   hud.setMode(view, view === 'cockpit' ? rect : undefined); hud.setLadder(ladder);
   if (hudOn) hud.update(camera, pose, aim, fake);
   snd.update(camera, fake, view);
@@ -68,6 +91,7 @@ requestAnimationFrame(frame);
 
 // ---- buttons
 const bar = document.getElementById('bar');
+if (P.has('nobar')) bar.style.display = 'none';
 const btn = (label, fn, toggle) => { const b = document.createElement('button'); b.textContent = label; b.onclick = () => { const r = fn(); if (toggle) b.classList.toggle('on', !!r); }; bar.appendChild(b); return b; };
 btn('Start audio', () => { snd.start(); snd.setVolume(menu.settings.volume); log.push('audio-start'); });
 btn('Menu: start', () => menu.show('start')); btn('pause', () => menu.show('pause')); btn('none', () => menu.show('none'));
@@ -80,7 +104,23 @@ btn('Speed 90/210/330 m/s', () => { fake.speed = fake.speed < 120 ? 210 : fake.s
 btn('PULL UP', () => (fake.warn.pullUp = !fake.warn.pullUp), true);
 btn('STALL', () => (fake.warn.stall = !fake.warn.stall), true);
 for (const n of ['launch', 'flare', 'pop', 'boom', 'bang', 'rocket', 'crack']) btn(n, () => { snd.oneShot(n); log.push('shot-' + n); });
-window.__bench = { log, snd, menu, hud, camera, setView(v) { view = v; }, status: () => snd.status() };
+if (fightOn) {
+  const sep = document.createElement('span'); sep.textContent = '| FIGHT'; sep.style.cssText = 'align-self:center;opacity:.7'; bar.appendChild(sep);
+  btn('Enemy: ' + scn.k, function () { const ks = Object.keys(SCN); scn.k = ks[(ks.indexOf(scn.k) + 1) % ks.length]; this.textContent = 'Enemy: ' + scn.k; });
+  btn('Lock 0/.5/locked', () => { scn.lock = scn.lock >= 1 ? 0 : scn.lock > 0 ? 1 : 0.5; });
+  btn('Missile warn', () => { scn.warn = scn.warn ? 0 : 1500; return scn.warn; }, true);
+  btn('Warn closer', () => { scn.warn = Math.max(150, (scn.warn || 1500) * 0.6); });
+  btn('Hit marker', () => { hud.onEvent({ type: 'gunHit', owner: 0, target: 1, pos: [0, 0, 0] }, 0); });
+  btn('Missile hit', () => { hud.onEvent({ type: 'missileHit', missile: 7, target: 1, owner: 0, pos: [0, 0, 0] }, 0); });
+  btn('I am hit', () => { hud.onEvent({ type: 'gunHit', owner: 1, target: 0, pos: [0, 0, 0] }, 0); });
+  btn('Ammo -1', () => { meF.missiles = (meF.missiles + 4) % 5; meF.flares = (meF.flares + 3) % 4; meF.gunAmmo = Math.max(0, meF.gunAmmo - 120); });
+  for (const k of ['round', 'roundWin', 'roundLose', 'win', 'lose', 'count']) btn('card ' + k, () => cards.show(k, { text: k === 'count' ? String(1 + Math.floor(Math.random() * 3)) : undefined }));
+  btn('hide card', () => cards.hide());
+  btn('Gun (hold sound)', () => (scn.gun = !scn.gun), true);
+  const ev = (type, extra = {}) => btn('snd ' + type, () => snd.onEvent({ type, owner: 1, target: 0, pos: [pose.pos[0] + 300, pose.pos[1], pose.pos[2] - 200], ...extra }, 0));
+  ev('missileFired'); ev('missileHit'); ev('gunHit', { owner: 0, target: 1 }); ev('gunHit'); ev('flare'); ev('missileGone', { reason: 'decoyed' }); ev('kill', { victim: 0, cause: 'gun' });
+}
+window.__bench = { log, cards, scn, meF, enF, snd, menu, hud, camera, setView(v) { view = v; }, status: () => snd.status() };
 </script>
 </body>
 </html>

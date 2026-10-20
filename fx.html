@@ -1,0 +1,196 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Weapon FX Bench</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #05070a; overflow: hidden; font: 12px system-ui, sans-serif; }
+  canvas { display: block; width: 100vw; height: 100vh; }
+  #load { position: fixed; inset: 0; display: grid; place-items: center; background: #05070a; color: #cfd8e3; z-index: 40; font-size: 14px; }
+  #load.gone { display: none; }
+  #info { position: fixed; left: 8px; top: 8px; color: #fff; opacity: .8; text-shadow: 0 1px 2px #000; white-space: pre; font: 12px/1.35 ui-monospace, Menlo, monospace; }
+  #credit { position: fixed; left: 8px; right: 8px; bottom: 4px; font-size: 10px; color: #fffa; text-shadow: 0 0 2px #000; pointer-events: none; }
+</style>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.186.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.186.0/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="load">Loading…</div>
+<div id="info"></div>
+<div id="credit"></div>
+<script type="module">
+// fx.html -- the WEAPON FX lane's bench: the real world, a static jet, and a FAKE combat (the same array shapes as combat.js)
+// that fires a missile every 4 s along a curving path at a moving point, drops flare salvos, streams tracers and makes hits.
+//   ?view=chase|side|missile|flares|hit|wide|lit   camera presets (wide looks toward the sun, lit has the sun behind the lens)
+//   ?freeze=<s>   stop the fake sim and the effects' clock at that sim time (rendering goes on): for screenshots
+//   ?perf=1       the engine's fps readout
+import * as THREE from 'three';
+import { createEngine } from './js/engine.js';
+import { buildJetWorld } from './js/jetworld.js';
+import { buildJet } from './js/jetmodel.js';
+import { poseMatrix, quatFromEuler } from './js/jetspec.js';
+import { createWeaponFx } from './js/weaponfx.js';
+
+const params = new URLSearchParams(location.search);
+const VIEW = params.get('view') || 'chase', FREEZE = params.has('freeze') ? +params.get('freeze') : Infinity;
+const loadEl = document.getElementById('load'), info = document.getElementById('info');
+
+// ---------------------------------------------------------------- fake combat (fixed pools, alive flags, like combat.js)
+function hashf(a, b) { let h = Math.imul(a ^ 0x9e3779b9, 0x85ebca6b) ^ Math.imul(b + 0x632be5ab, 0xc2b2ae35); h ^= h >>> 15; h = Math.imul(h, 0x2c1b3c6d); h ^= h >>> 13; return (h >>> 0) / 4294967296; }
+function fakeCombat(P0, F, Rt, onEvent) {
+  const UP = [0, 1, 0];
+  const missiles = Array.from({ length: 8 }, () => ({ id: 0, owner: 0, target: 1, pos: [0, 0, 0], vel: [0, 0, 0], age: 0, motor: 0, alive: false, decoy: -1 }));
+  const bullets = Array.from({ length: 300 }, () => ({ owner: 0, pos: [0, 0, 0], vel: [0, 0, 0], age: 0, alive: false }));
+  const flares = Array.from({ length: 48 }, () => ({ owner: 0, pos: [0, 0, 0], vel: [0, 0, 0], age: 0, burn: 0, alive: false }));
+  const T = [0, 0, 0], d3 = [0, 0, 0], lastHit = [NaN, 0, 0];
+  let t = 0, nextId = 1, lastM = -3.5, lastS = -3.5, salvoLeft = 0, salvoT = 0, gunT = 0, bi = 0, fi = 0, shots = 0, nf = 0;
+  const target = (tt, o) => {
+    const a = 2200 + 300 * Math.sin(0.21 * tt), s = 900 * Math.sin(0.35 * tt), u = 250 + 150 * Math.cos(0.5 * tt);
+    for (let i = 0; i < 3; i++) o[i] = P0[i] + F[i] * a + Rt[i] * s + UP[i] * u;
+    return o;
+  };
+  const sub = (a, b, o) => { o[0] = a[0] - b[0]; o[1] = a[1] - b[1]; o[2] = a[2] - b[2]; return Math.hypot(o[0], o[1], o[2]); };
+  function step(dt) {
+    t += dt; target(t, T);
+    // a missile every 4 s, launched off-bore (alternating sides) so it curves onto the target
+    if (t - lastM >= 4) {
+      lastM = t;
+      const m = missiles.find((x) => !x.alive);
+      if (m) {
+        const sd = nextId % 2 ? 1 : -1;
+        m.id = nextId++; m.alive = true; m.age = 0; m.motor = 0;
+        for (let i = 0; i < 3; i++) { m.pos[i] = P0[i] + Rt[i] * 2.6 * sd - UP[i] * 0.6; m.vel[i] = F[i] * 230 + Rt[i] * 110 * sd + UP[i] * 70; }
+        onEvent({ type: 'missileFired', owner: 0, missile: m.id, target: 1 });
+      }
+    }
+    for (const m of missiles) {
+      if (!m.alive) continue;
+      m.age += dt;
+      m.motor = m.age < 0.1 ? m.age / 0.1 : m.age < 2.3 ? 1 : Math.max(0, 1 - (m.age - 2.3) / 0.2);
+      let v = Math.hypot(m.vel[0], m.vel[1], m.vel[2]);
+      const dist = sub(T, m.pos, d3), k = Math.min(1, 3 * dt);
+      for (let i = 0; i < 3; i++) m.vel[i] = (m.vel[i] / v) * (1 - k) + (d3[i] / dist) * k;
+      const l = Math.hypot(m.vel[0], m.vel[1], m.vel[2]);
+      v = Math.min(800, v + (m.motor > 0 ? 260 * m.motor : -25) * dt);
+      for (let i = 0; i < 3; i++) { m.vel[i] = m.vel[i] / l * v; m.pos[i] += m.vel[i] * dt; }
+      if (dist < 45) { m.alive = false; lastHit[0] = m.pos[0]; lastHit[1] = m.pos[1]; lastHit[2] = m.pos[2]; onEvent({ type: 'missileHit', missile: m.id, target: 1, pos: m.pos.slice() }); }
+      else if (m.age > 9) { m.alive = false; onEvent({ type: 'missileGone', missile: m.id, reason: 'fuel' }); }
+    }
+    // a salvo of 6 flares every 5 s, 0.12 s apart, fanning left/right and drooping
+    if (t - lastS >= 5) { lastS = t; salvoLeft = 6; salvoT = 0; }
+    if (salvoLeft > 0 && (salvoT -= dt) <= 0) {
+      salvoLeft--; salvoT = 0.12;
+      const f = flares[fi]; fi = (fi + 1) % flares.length; nf++;
+      const sd = nf % 2 ? 1 : -1, r = hashf(nf, 1);
+      f.alive = true; f.age = 0; f.burn = 0;
+      for (let i = 0; i < 3; i++) { f.pos[i] = P0[i] - UP[i] * 0.8 - F[i] * 3; f.vel[i] = -F[i] * (120 + 40 * r) + Rt[i] * sd * (25 + 20 * r) - UP[i] * 20; }
+      onEvent({ type: 'flare', owner: 0, pos: f.pos.slice() });
+    }
+    for (const f of flares) {
+      if (!f.alive) continue;
+      f.age += dt;
+      const e = Math.exp(-dt / 0.45);
+      f.vel[0] = 4 + (f.vel[0] - 4) * e; f.vel[2] = 1.5 + (f.vel[2] - 1.5) * e; f.vel[1] = -25 + (f.vel[1] + 25) * e;
+      for (let i = 0; i < 3; i++) f.pos[i] += f.vel[i] * dt;
+      f.burn = f.age < 0.08 ? f.age / 0.08 : f.age < 2.5 ? 1 : Math.max(0, 1 - (f.age - 2.5) / 0.6);
+      if (f.age > 3.1) f.alive = false;
+    }
+    // the gun: 1.2 s bursts every 3 s, 50 rounds/s at the target, a little dispersion
+    gunT -= dt;
+    if (t % 3 < 1.2 && gunT <= 0) {
+      gunT = 0.02; shots++;
+      const b = bullets[bi]; bi = (bi + 1) % bullets.length;
+      const dist = sub(T, P0, d3), lead = 1.0;
+      b.alive = true; b.age = 0;
+      for (let i = 0; i < 3; i++) { b.pos[i] = P0[i] + F[i] * 6; b.vel[i] = d3[i] / dist * 1000 + (hashf(shots, i) - 0.5) * 9 * lead; }
+      if (shots % 5 === 0) onEvent({ type: 'gunFired', owner: 0 });
+    }
+    for (const b of bullets) {
+      if (!b.alive) continue;
+      b.age += dt; b.vel[1] -= 9.81 * dt;
+      for (let i = 0; i < 3; i++) b.pos[i] += b.vel[i] * dt;
+      if (sub(T, b.pos, d3) < 70 && hashf(shots, 9) < 0.5) { b.alive = false; onEvent({ type: 'gunHit', owner: 0, target: 1, pos: b.pos.slice() }); }
+      else if (b.age > 3) b.alive = false;
+    }
+  }
+  return { missiles, bullets, flares, step, target: () => T, lastHit, get t() { return t; } };
+}
+
+// ---------------------------------------------------------------- boot
+try {
+  const engine = await createEngine({ canvas: document.getElementById('c'), params });
+  const { scene, camera } = engine;
+  loadEl.textContent = 'Building the world…';
+  const world = await buildJetWorld(scene, engine.renderer, { seed: 7 });
+  engine.configure({ bloom: world.bloom, exposure: world.exposure });
+  document.getElementById('credit').textContent = world.credit || '';
+
+  const jet = buildJet(0, { screenLight: false });
+  world.applyEnv(jet.group); scene.add(jet.group);
+  const sp = world.spawn, h = sp.heading;
+  const P0 = [sp.pos[0], sp.pos[1] + 150, sp.pos[2]], F = [Math.sin(h), 0, -Math.cos(h)], Rt = [Math.cos(h), 0, Math.sin(h)];
+  jet.group.matrixAutoUpdate = false;
+  jet.group.matrix.fromArray(poseMatrix(P0, quatFromEuler(h, 0, 0), new Array(16)));
+  jet.group.matrixWorldNeedsUpdate = true;
+
+  const wfx = createWeaponFx(scene, { buildMissile: jet.buildMissile, world });
+  const events = [];   // [t, type] of the last 64 events (window.__fx.events)
+  const combat = fakeCombat(P0, F, Rt, (e) => { wfx.onEvent(e); if (e.type !== 'gunFired' && e.type !== 'flare') { events.push([+combat.t.toFixed(2), e.type, e.reason || '', e.pos]); if (events.length > 64) events.shift(); } });
+  window.__fx = { wfx, combat, engine, events, get fxMs() { return fxMs; } };
+
+  // ---- camera presets
+  const V3 = (a, b = [0, 0, 0], k = 1) => new THREE.Vector3(a[0] + b[0] * k, a[1] + b[1] * k, a[2] + b[2] * k);
+  const C = V3(P0, F, 1100), sunH = world.sunDir.clone().setY(0).normalize(), look = new THREE.Vector3(), cp = new THREE.Vector3();
+  const above = (v, m) => { v.y = Math.max(v.y, world.terrainHeightAt(v.x, v.z) + m); return v; };
+  function placeCamera() {   // (hit: the latest hit point, else the moving target)
+    if (VIEW === 'side') { cp.copy(C).addScaledVector(V3(Rt), 1500); cp.y += 150; look.copy(C); }
+    else if (VIEW === 'flares') { cp.copy(V3(P0, Rt, 75)).addScaledVector(V3(F), -15); cp.y += 8; look.copy(V3(P0, F, -70)); look.y -= 18; }
+    else if (VIEW === 'hit') { const T = isNaN(combat.lastHit[0]) ? combat.target() : combat.lastHit; cp.set(T[0], T[1], T[2]).addScaledVector(V3(Rt), 90).addScaledVector(V3(F), -80); cp.y += 25; look.set(T[0], T[1], T[2]); }
+    else if (VIEW === 'wide') { cp.copy(C).addScaledVector(sunH, -1300).addScaledVector(V3(Rt), 300); cp.y += 220; look.copy(C); look.y += 120; }
+    else if (VIEW === 'lit') { cp.copy(C).addScaledVector(sunH, 450).addScaledVector(V3(Rt), -150); cp.y += 160; look.copy(C); look.y += 100; }
+    else if (VIEW === 'missile') {
+      let m = null; for (const x of combat.missiles) if (x.alive && (!m || x.id > m.id)) m = x;
+      if (m) {
+        const v = Math.hypot(...m.vel) || 1, d = [m.vel[0] / v, m.vel[1] / v, m.vel[2] / v];
+        const sx = -d[2], sz = d[0], sl = Math.hypot(sx, sz) || 1;   // beside it, a little behind: a three-quarter view
+        cp.set(m.pos[0] - d[0] * 14 + sx / sl * 16, m.pos[1] - d[1] * 14 + 4, m.pos[2] - d[2] * 14 + sz / sl * 16);
+        look.set(m.pos[0] - d[0] * 6, m.pos[1] - d[1] * 6, m.pos[2] - d[2] * 6);
+      } else { cp.copy(V3(P0, F, -40)); cp.y += 9; look.copy(V3(P0, F, 300)); }
+    } else { cp.copy(V3(P0, F, -42)).addScaledVector(V3(Rt), 7); cp.y += 9; look.copy(V3(P0, F, 400)); }
+    camera.position.copy(above(cp, 30)); camera.lookAt(look);
+  }
+
+  placeCamera();
+  loadEl.textContent = 'Warming up…';
+  await engine.warmUp([() => { placeCamera(); world.update(0, camera); wfx.warmUp(camera); }]);
+
+  let simT = 0, lastInfo = 0, fxMs = 0;
+  const step = (dt) => { if (simT < FREEZE) { combat.step(dt); simT += dt; } };
+  const frame = (alpha, dt) => {
+    placeCamera();
+    world.update(simT, camera);
+    const c0 = performance.now();
+    wfx.update(simT < FREEZE ? dt : 0, combat, camera);
+    fxMs += (performance.now() - c0 - fxMs) * 0.05;
+    if (performance.now() - lastInfo > 400) {
+      lastInfo = performance.now();
+      const s = wfx.stats(), st = engine.stats;
+      info.textContent = `fx cpu ${fxMs.toFixed(2)} ms\nview ${VIEW}  t ${simT.toFixed(1)}${simT >= FREEZE ? ' (frozen)' : ''}\npuffs ${s.puffs}  trails ${s.trails}  bursts ${s.bursts}\n${st.fps ? `${st.fps.toFixed(0)} fps  ${st.frameMs.toFixed(1)} ms${st.gpuMs != null ? `  gpu ${st.gpuMs.toFixed(1)} ms` : ''}` : ''}`;
+    }
+  };
+  engine.run(step, frame);
+  window.__ready = true;
+  loadEl.classList.add('gone');
+} catch (e) {
+  console.error('[fx] failed:', e && e.stack || e);
+  loadEl.textContent = 'Failed: ' + (e && e.message || e);
+}
+</script>
+</body>
+</html>
