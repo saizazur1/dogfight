@@ -15,7 +15,9 @@ const $ = (id) => document.getElementById(id);
 const params = new URLSearchParams(location.search);
 const progress = (frac, text) => { $('loadBar').style.width = `${Math.round(frac * 100)}%`; if (text) $('loadText').textContent = text; };
 const fail = (e) => { console.error(e); $('loadText').textContent = `Could not start: ${e?.message || e}`; $('loadText').style.color = '#ff4d3d'; };
-addEventListener('unhandledrejection', (e) => fail(e.reason));
+// Not fail(): boot() errors are caught below; a stray rejection (often a browser extension, e.g. "reading 'M_ID'") must
+// not paint "Could not start" over a game that is loading fine.
+addEventListener('unhandledrejection', (e) => console.warn('unhandled rejection (ignored):', e.reason));
 
 try {
   await boot();
