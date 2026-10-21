@@ -5,3 +5,9 @@
  * (Metered's TURN credentials API); lock it to saizazur1.github.io in the Metered dashboard. Empty = direct connections only.
  */
 export const RELAY = { app: '', apiKey: '' };
+
+/**
+ * SUPABASE: the relay used when a friend can't connect directly (net.js relayConn). Project URL + the anon / publishable key
+ * (a browser key by design: never the service_role key). Empty = direct connections only.
+ */
+export const SUPABASE = { url: '', anonKey: '' };

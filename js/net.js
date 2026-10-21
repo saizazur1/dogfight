@@ -21,9 +21,15 @@
  * Joining a RUNNING match is allowed: the joiner takes the lowest free seat (an AI's seat if AIs fill the field) and gets the
  * start message at once. join() throws 'full' only when 8 people are in. Seats 0..7, the host is 0. Pings every 2 s (players[].ping);
  * 10 s of silence drops a client (its jet goes to an AI) or, on a client, closes with 'lost'.
+ * RELAY FALLBACK (config.js SUPABASE): when a client can't open a direct connection (office / school networks, phone carriers)
+ * it joins through a Supabase Realtime broadcast channel instead. The host listens on `df-<code>` for knocks; each relayed client
+ * gets its own channel `df-<code>-<id>` with a DataConnection look-alike (relayConn) on both ends, so everything above is
+ * unchanged. Supabase's free plan allows 100 messages/s per project (sent + received), so a relay packet goes at most RELAY_HZ
+ * times a second each way: the newest binary snapshot/state (older ones are dropped: they are full states) plus every object
+ * message queued since, in order. ~40 messages/s per relayed friend; direct friends cost nothing. `?relayonly` (test) skips direct.
  */
 import * as PJ from 'peerjs';
-import { RELAY } from './config.js';
+import { RELAY, SUPABASE } from './config.js';
 
 let relayP = null;
 /** STUN + the Metered TURN relay's servers (config.js RELAY), fetched once per page; null = PeerJS's defaults (no relay). */
@@ -45,10 +51,58 @@ const Peer = PJ.Peer || PJ.default;
 export const ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';   // no 0 O 1 I L
 export const SEATS = 8;
 const PALETTE = ['#c8362c', '#2b62cf', '#e0a020', '#3a9d5a', '#8a4fd0', '#e7e7ea', '#2a2d33', '#e0663a'];   // the start screen's 8 colours (menu.js COLORS): a clash moves to another one of them
+const RELAY_HZ = 10, DIRECT_MS = 9000, HAS_SB = !!(SUPABASE.url && SUPABASE.anonKey);
 const PREFIX = 'dogfightio-', PING_MS = 2000, SILENT_MS = 10000, JOIN_MS = 15000, OPEN_MS = 12000, BACKLOG = 512;
 
 const err = (code, message) => { const e = new Error(message || code); e.code = code; return e; };
 /** a random room code */
+let sbP = null;
+/** the Supabase client, loaded on first use (only a relayed game pays for the download) */
+function supabase() {
+  return sbP ||= import('@supabase/supabase-js').then(({ createClient }) => createClient(SUPABASE.url, SUPABASE.anonKey, {
+    auth: { persistSession: false, autoRefreshToken: false }, realtime: { params: { eventsPerSecond: 40 } } }));
+}
+const toB64 = (buf) => { const u = new Uint8Array(buf); let s = ''; for (let i = 0; i < u.length; i += 0x8000) s += String.fromCharCode.apply(null, u.subarray(i, i + 0x8000)); return btoa(s); };
+const fromB64 = (b) => { const s = atob(b), u = new Uint8Array(s.length); for (let i = 0; i < s.length; i++) u[i] = s.charCodeAt(i); return u.buffer; };
+/** Opens a Supabase broadcast channel and calls back when subscribed (or failed). */
+async function sbChannel(topic, onStatus) {
+  const sb = await supabase(), ch = sb.channel(topic, { config: { broadcast: { self: false, ack: false } } });
+  return { sb, ch, go: () => ch.subscribe(onStatus) };
+}
+/**
+ * A PeerJS DataConnection look-alike over one Supabase broadcast channel: on('open'|'data'|'close'|'error'), send(msg), close(),
+ * open, relay: true. Batched at RELAY_HZ: { o: [objects in order], b: newest ArrayBuffer as base64 }.
+ */
+export async function relayConn(topic) {
+  const ev = { open: [], data: [], close: [], error: [] }, objs = [];
+  const fire = (k, a) => { for (const f of ev[k]) try { f(a); } catch (e) { console.error('net: relay listener', e); } };
+  let bin = null, iv = 0, dead = false;
+  const c = {
+    open: false, relay: true, peerConnection: null,
+    on(k, f) { ev[k]?.push(f); return c; },
+    send(msg) { if (msg instanceof ArrayBuffer) bin = msg; else if (ArrayBuffer.isView(msg)) bin = msg.buffer.slice(msg.byteOffset, msg.byteOffset + msg.byteLength); else objs.push(msg); },
+    close() { if (dead) return; dead = true; flush(); clearInterval(iv); setTimeout(() => { try { S.sb.removeChannel(S.ch); } catch { /* gone */ } }, 300); const was = c.open; c.open = false; if (was) fire('close'); },
+  };
+  function flush() {
+    if (!c.open || (!bin && !objs.length)) return;
+    const payload = {};
+    if (objs.length) payload.o = objs.splice(0);
+    if (bin) { payload.b = toB64(bin); bin = null; }
+    S.ch.send({ type: 'broadcast', event: 'p', payload }).catch?.((e) => console.warn('net: relay send', e));
+  }
+  const S = await sbChannel(topic, (status) => {
+    if (status === 'SUBSCRIBED') { if (!c.open && !dead) { c.open = true; iv = setInterval(flush, 1000 / RELAY_HZ); fire('open'); } }
+    else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT' || status === 'CLOSED') { if (c.open) c.close(); else if (!dead) fire('error', { type: `relay-${status.toLowerCase()}` }); }
+  });
+  S.ch.on('broadcast', { event: 'p' }, ({ payload }) => {
+    if (dead || !payload) return;
+    if (Array.isArray(payload.o)) for (const m of payload.o) fire('data', m);
+    if (typeof payload.b === 'string') { let b = null; try { b = fromB64(payload.b); } catch { /* bad packet */ } if (b) fire('data', b); }
+  });
+  S.go();
+  return c;
+}
+
 export function newCode() {
   const r = new Uint32Array(5); crypto.getRandomValues(r);
   let s = ''; for (let i = 0; i < 5; i++) s += ALPHABET[r[i] % ALPHABET.length];
@@ -59,7 +113,7 @@ const cleanColor = (c) => (/^#[0-9a-f]{6}$/i.test(c) ? c : '#e7e7ea');
 const nowMs = () => performance.now();
 
 export function createNet() {
-  let peer = null, hostConn = null, timer = 0, closed = true, lastHeard = 0, me = null;
+  let peer = null, hostConn = null, timer = 0, closed = true, lastHeard = 0, me = null, knock = null;   // knock: the host's relay door
   const recs = new Set(), listeners = new Set(), backlog = [];
   let list = [];   // players (internal records), by seat
 
@@ -121,8 +175,21 @@ export function createNet() {
     timer = setInterval(hostTick, PING_MS);
     net.connected = true;
     list = [me];
+    if (HAS_SB) listenKnocks(net.code).catch((e) => console.warn('net: relay off (host)', e));
     emitPlayers();
     return net.code;
+  }
+  /** host: relayed clients knock on `df-<code>`; each gets a relayConn on its own channel, then the usual hello / welcome */
+  async function listenKnocks(code) {
+    const seen = new Set();
+    knock = await sbChannel(`df-${code}`, (st) => { if (st !== 'SUBSCRIBED') console.info('net: knock channel', st); });
+    knock.ch.on('broadcast', { event: 'knock' }, async ({ payload }) => {
+      const id = String(payload?.id || '').replace(/[^a-z0-9]/gi, '').slice(0, 16);
+      if (!id || seen.has(id) || closed) return;
+      seen.add(id);
+      try { const conn = await relayConn(`df-${code}-${id}`); if (!closed) onConnection(conn); else conn.close(); } catch (e) { console.warn('net: relay conn', e); }
+    });
+    knock.go();
   }
   function onConnection(conn) {
     const rec = { conn, seat: -1, player: null, last: nowMs(), dropped: false };
@@ -196,27 +263,58 @@ export function createNet() {
     reset();
     const c = String(code || '').toUpperCase().replace(/[^0-9A-Z]/g, '');
     if (c.length !== 5 || [...c].some((ch) => !ALPHABET.includes(ch))) { leave(); throw err('not-found', `No room ${c}`); }
-    try { peer = await openPeer(null); }
-    catch (e) { leave(); throw err('failed', `Could not reach the signalling server (${e?.type || e?.message || e})`); }
-    if (closed) throw err('failed', 'left');
-    return new Promise((resolve, reject) => {
-      let pending = true;
+    const relayOnly = HAS_SB && /[?&]relayonly\b/.test(globalThis.location?.search || '');
+    let direct = null;
+    if (!relayOnly) {
+      try { peer = await openPeer(null); direct = await handshake(c, name, color, () => peer.connect(PREFIX + c, { reliable: true, serialization: 'binary' }), HAS_SB ? DIRECT_MS : JOIN_MS); return; }
+      catch (e) { direct = e; if (closed) throw err('failed', 'left'); if (!HAS_SB || e.code === 'not-found' || e.code === 'full') { leave(); throw e; } }
+      console.info(`net: direct connection failed (${direct?.message}); trying the relay`);
+      try { peer?.destroy(); } catch { /* gone */ } peer = null; closed = false;
+    }
+    const id = Math.random().toString(36).slice(2, 12);
+    try {
+      await handshake(c, name, color, () => null, JOIN_MS, async () => {
+        const conn = await relayConn(`df-${c}-${id}`);
+        conn.on('open', () => knockOn(c, id));
+        return conn;
+      });
+    } catch (e) { leave(); throw e.code ? e : err('failed', `Could not connect (relay: ${e?.message || e})`); }
+  }
+  /** client: rings the host's knock channel (a few times: the host may still be subscribing to our channel) */
+  async function knockOn(code, id) {
+    const k = await sbChannel(`df-${code}`, (st) => {
+      if (st !== 'SUBSCRIBED') return;
+      let n = 0, t = 0;
+      const ring = () => { if (closed || net.connected || n++ > 8) { clearInterval(t); setTimeout(() => k.sb.removeChannel(k.ch), 500); return; } k.ch.send({ type: 'broadcast', event: 'knock', payload: { id } }); };
+      t = setInterval(ring, 1500); ring();
+    });
+    k.go();
+  }
+  /**
+   * The hello / welcome exchange on one connection. connect() gives a PeerJS connection (direct), or makeConn() a relayConn.
+   * Resolves once welcomed (hostConn set, net.connected); rejects with { code } on reject / error / timeout (the caller cleans up).
+   */
+  function handshake(c, name, color, connect, ms, makeConn) {
+    return new Promise(async (resolve, reject) => {
+      let pending = true, hi = 0;
       const finish = (e) => {
         if (!pending) return;
-        pending = false; clearTimeout(to);
-        if (e) { leave(); reject(e); return; }
+        pending = false; clearTimeout(to); clearInterval(hi);
+        if (e) { try { hostConn?.close(); } catch { /* gone */ } hostConn = null; reject(e); return; }
         net.connected = true; lastHeard = nowMs();
         timer = setInterval(() => { if (nowMs() - lastHeard > SILENT_MS) lost('lost'); }, PING_MS);
         resolve();
       };
-      const to = setTimeout(() => finish(err('failed', 'Timed out joining (failed)')), JOIN_MS);
-      peer.on('error', (e) => {
+      const to = setTimeout(() => finish(err('failed', 'Timed out joining (failed)')), ms);
+      if (peer) peer.on('error', (e) => {
         if (pending) finish(e?.type === 'peer-unavailable' ? err('not-found', `No room ${c}`) : err('failed', `Could not connect (${e?.type || e?.message || e})`));
         else console.warn('net: peer', e?.type, e?.message);
       });
-      const conn = hostConn = peer.connect(PREFIX + c, { reliable: true, serialization: 'binary' });
+      let conn;
+      try { conn = hostConn = makeConn ? await makeConn() : connect(); } catch (e) { finish(err('failed', `Could not connect (${e?.message || e})`)); return; }
       if (!conn) { finish(err('failed', 'Could not connect (no connection)')); return; }
-      conn.on('open', () => safeSend(conn, { k: 'hello', v: 1, name: cleanName(name), color: cleanColor(color) }));
+      const hello = () => safeSend(conn, { k: 'hello', v: 1, name: cleanName(name), color: cleanColor(color) });
+      conn.on('open', () => { hello(); if (conn.relay) hi = setInterval(() => pending && hello(), 1500); });   // a relay hello can land before the host listens
       conn.on('data', (d) => {
         lastHeard = nowMs();
         if (pending) {
@@ -268,6 +366,7 @@ export function createNet() {
     else safeSend(hostConn, { k: 'bye' });
     const conns = [...recs].map((r) => r.conn).concat(hostConn ? [hostConn] : []), p = peer;
     recs.clear(); hostConn = null; peer = null;
+    if (knock) { const k = knock; knock = null; setTimeout(() => { try { k.sb.removeChannel(k.ch); } catch { /* gone */ } }, 150); }
     net.connected = false; net.started = false; list = [];
     setTimeout(() => { for (const c of conns) try { c.close(); } catch { /* gone */ } try { p?.destroy(); } catch { /* gone */ } }, 150);   // let the byes leave first
   }
