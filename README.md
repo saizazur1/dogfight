@@ -251,3 +251,36 @@ As built: `missileHit` / `gunHit` on a shielded jet carry `shielded: true` (game
 arcade: one missile kills and the gun hits 1.5x harder (combat.TUNE, put back in its stop()); pick-ups stay within ARENA_R + 1.5 km
 (`pu.start({ radius })`); AI targets are sticky (kept unless another jet is under half as far). `?nohooks` (test only) runs the
 game without the hooks, to A/B their cost.
+
+## Online contract (Phase 6: play with friends)
+
+Owner's choices: **peer-to-peer** (one player's browser hosts the match, free, no server account) and **GitHub Pages** for the
+game itself (publishing only after the owner says yes). Plan: free-for-all, up to 8 jets, AIs fill empty seats, room link, no accounts.
+
+- **Transport:** PeerJS 1.5.4 (`https://cdn.jsdelivr.net/npm/peerjs@1.5.4/+esm` in the import map) with its free cloud signalling
+  server and its default STUN/TURN. Room code: 5 letters/digits without look-alikes (no 0/O/1/I/L); the host's peer id is
+  `dogfightio-<code>`. Link: `<page url>?room=<CODE>`. Star topology: every client talks only to the host.
+- **Authority:** the HOST runs the match exactly as today (combat, AIs, power-ups, kills, the clock). Each CLIENT flies its own jet
+  locally (stepJet with its own controls, so steering feels instant) and sends its jet state + weapon triggers ~30 Hz; the host
+  writes them onto that player's fighter (no stepJet for remote humans) and its combat fires their weapons. The host sends a
+  snapshot ~20 Hz (every fighter, missiles, pick-ups, clock, scores) and every event (reliable, in order), so the client's HUD,
+  sound, hype, radar and XP run off the same `onEvent` stream. Damage, kills and pick-ups are decided only by the host.
+  ponytail: friends-only trust (a client could lie about its position); a server can take over later without changing the records.
+- **Seats:** fighter id = seat (0..7). The host is seat 0 on the host; on a client its own seat is `game.me` (fighters list
+  re-indexed so `me` is still `fighters[0]` locally, ids stay the host's seat ids).
+- **Mode:** the Chaos rules (free-for-all, most kills, back in 3 s, power-ups, leaderboard), 3 or 5 minutes, AIs filling to 8
+  (host's choice). Leaving: a client's jet is taken over by an AI; the host leaving ends the match for everyone ("Host left").
+  No pausing online (Esc opens the menu, the match goes on).
+
+```js
+// net.js (lane NET)
+const net = createNet();
+const code = await net.host({ name, color });      // opens a room
+await net.join(code, { name, color });              // throws { code: 'not-found'|'full'|'failed'|'started' }
+net.code, net.isHost, net.seat, net.players         // players: [{ seat, name, color, ping, isHost, isMe }]
+net.onPlayers = (players) => {};  net.onStart = (cfg) => {};  net.onClose = (reason) => {};
+net.start({ minutes: 3|5, bots: true|false });      // host only: everyone's game starts
+net.leave();
+// game.js (lane NET): game.playOnline(net, cfg) starts the synced match on host and clients alike
+// lobby.js (lane LOBBY): createLobby(document.body, { net, game, menu }) → open(), openJoin(code), close()
+```
