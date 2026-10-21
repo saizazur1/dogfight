@@ -326,3 +326,6 @@ Files: `js/net.js` (rooms), `js/netgame.js` (the sync: codec, snapshot buffer, t
   `?joinroom=CODE` joins it (main.js's `?room=CODE` is the human invite link); `?bot` lets an AI fly this browser's jet; `?name=`.
   `node tools/duo.mjs [maxSeconds] [minutes] [outDir]`: two headless Chromes (ports 9381 / 9382) play a match and compare;
   `DUO_LEAVE=1` adds leave / re-join / host-left.
+Relay (TURN): PeerJS's free relay and Metered's old public one both stopped answering (2026-10-21), and a friend at home could
+not join a host on an office LAN. `js/config.js` `RELAY = { app, apiKey }` (a Metered Open Relay app, free 20 GB/month) adds
+its TURN servers to every Peer; empty = direct connections only.

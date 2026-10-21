@@ -23,6 +23,23 @@
  * 10 s of silence drops a client (its jet goes to an AI) or, on a client, closes with 'lost'.
  */
 import * as PJ from 'peerjs';
+import { RELAY } from './config.js';
+
+let relayP = null;
+/** STUN + the Metered TURN relay's servers (config.js RELAY), fetched once per page; null = PeerJS's defaults (no relay). */
+function relayServers() {
+  if (!RELAY.app || !RELAY.apiKey) return Promise.resolve(null);
+  return relayP ||= (async () => {
+    try {
+      const ac = new AbortController(), to = setTimeout(() => ac.abort(), 5000);
+      const r = await fetch(`https://${RELAY.app}.metered.live/api/v1/turn/credentials?apiKey=${encodeURIComponent(RELAY.apiKey)}`, { signal: ac.signal });
+      clearTimeout(to);
+      const list = await r.json();
+      if (!Array.isArray(list) || !list.length) throw new Error(`relay answered ${r.status}`);
+      return [{ urls: 'stun:stun.l.google.com:19302' }, ...list];
+    } catch (e) { console.warn('net: relay unavailable, direct connections only', e); relayP = null; return null; }
+  })();
+}
 
 const Peer = PJ.Peer || PJ.default;
 export const ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';   // no 0 O 1 I L
@@ -65,10 +82,12 @@ export function createNet() {
     return () => listeners.delete(fn);
   }
 
-  /** a Peer with this id (or a random one), open on the signalling server */
-  function openPeer(id) {
+  /** a Peer with this id (or a random one), open on the signalling server (with the relay's servers when configured) */
+  async function openPeer(id) {
+    const iceServers = await relayServers();
+    const opts = iceServers ? { debug: 1, config: { iceServers } } : { debug: 1 };
     return new Promise((resolve, reject) => {
-      const p = id ? new Peer(id, { debug: 1 }) : new Peer({ debug: 1 });
+      const p = id ? new Peer(id, opts) : new Peer(opts);
       const to = setTimeout(() => { done(); p.destroy(); reject(err('failed', 'signalling timeout')); }, OPEN_MS);
       const onOpen = () => { done(); resolve(p); };
       const onErr = (e) => { done(); p.destroy(); reject(e); };
