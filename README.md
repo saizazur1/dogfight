@@ -284,3 +284,45 @@ net.leave();
 // game.js (lane NET): game.playOnline(net, cfg) starts the synced match on host and clients alike
 // lobby.js (lane LOBBY): createLobby(document.body, { net, game, menu }) → open(), openJoin(code), close()
 ```
+
+### As built (lane NET)
+
+Files: `js/net.js` (rooms), `js/netgame.js` (the sync: codec, snapshot buffer, trigger counts, host / client controller, pure,
+`js/net.check.mjs` runs it in node), `js/game.js` (`playOnline`), `js/chaos.js` (online host / client variants), `tools/duo.mjs`.
+
+- **net.js extras** (for game.js; the lobby only needs the API above): `net.listen(fn) -> off` (`fn(type, data, seat)`: `'msg'`
+  game messages, `'join'` a player joined a running match, `'leave'` a seat left; game messages that arrive before anyone listens
+  are kept for the next listener), `net.send(to, msg)` (host: a seat or -1 = all; client: the host), `net.endMatch()`,
+  `net.connected`, `net.started`, `net.cfg`, `await net.traffic()` (data-channel bytes). `net.onClose` reasons: `'host-left'`
+  (the host left or closed the room) and `'lost'` (10 s of silence); never for our own `leave()`. `leave()` is safe twice.
+  cfg = `{ minutes, bots, seed, players: [{ seat, name, color, ping }] }`. Names are cleaned (no `<>&"'`, ≤ 20 chars), colours
+  must be `#rrggbb`; a colour already in the room is swapped for the next free one so friends can tell each other apart.
+- **Joining a running match** is allowed (no `'started'` error): the joiner takes the lowest free seat, an AI's when AIs fill the
+  field (its score starts at 0), and is in the air at the farthest start slot. `'full'` = 8 people. Leaving mid-match: an AI flies
+  the jet on (score kept with the seat).
+- **Leaving / ending** (lobby contract): Quit in the pause menu, or Space / Esc on the end card → `game.quit()` →
+  `game.onOnlineEnd?.()` (back to the room; the net stays open). A client's quit hands its jet to an AI; the HOST's quit ends the
+  match for everyone (`abort`: every client goes back to the room). `game.quit()` also works when the lobby calls it after
+  `host-left` (then no `onOnlineEnd`). No pause online: Esc opens the menu over the running match; Resume returns.
+- **Sync** (details in netgame.js's header): host → clients a 20 Hz binary snapshot (~0.6–1.2 KB with 8 jets: pose, hp, ammo,
+  lock, warn, shield, boost, kills / deaths, life; live missiles; live pick-ups; clock, phase) right after that tick's events
+  (`{k:'ev', l}`; every event but `match`); client → host a 30 Hz 64-byte state (pose + model bits, `life`, crashed, gun held,
+  missile / flare press COUNTS: each new count becomes one rising edge in the host's combat, so a press is never lost or doubled).
+  `fighter.life` (bumped by every placement) keeps an old life's packets away from a respawned jet. Respawns: the host sends
+  `{k:'respawn', pos, heading, speed, life}` and the client places its own jet.
+- **What a client sees:** its own jet flown and crashed locally (instant steering); other jets 100 ms behind the host's clock,
+  Hermite-interpolated between snapshots (extrapolated if the buffer runs dry; `?netdelay=ms` changes the delay, 0 = present
+  time); missiles from the newest snapshot moved along their velocity to that same time (mine to "now", so they leave my rails);
+  tracers and flares made locally (the jets' gun bits / the host's flare events, my own from my trigger at once) with no damage.
+  HUD, sound, hype, radar, XP all run off the host's events with `meId` = my seat. Host's events apply on arrival (a hit shows as
+  soon as it lands on the host). Ids = seats on every machine; a client's pool is re-mapped so `me` stays `pool[0]`.
+- **Host side:** remote players' jets are set every step from their states at the player's own clock "now" (extrapolated with
+  the velocity and spin), so what the host shoots at is where they are drawn. No slow motion online.
+- **Known limits:** friends-only trust (positions and crashes are the client's word); one reliable ordered channel (PeerJS's
+  "unreliable" is only unordered and needs its own WebRTC connection: a lost packet stalls the stream by one round trip); a client's
+  guns aim at a picture ~100 ms + half a ping old, so crossing gun shots favour the host (missiles lock and are unaffected); the
+  host's browser tab must stay in front (a hidden tab pauses its loop and so the match); strict NATs need PeerJS's free TURN.
+- **Test only:** `?host[&autostart=N][&minutes=M][&nobots]` opens a room (console `ROOM <code>`) and starts when N people are in;
+  `?joinroom=CODE` joins it (main.js's `?room=CODE` is the human invite link); `?bot` lets an AI fly this browser's jet; `?name=`.
+  `node tools/duo.mjs [maxSeconds] [minutes] [outDir]`: two headless Chromes (ports 9381 / 9382) play a match and compare;
+  `DUO_LEAVE=1` adds leave / re-join / host-left.

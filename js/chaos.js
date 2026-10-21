@@ -4,6 +4,14 @@
  * toward me). Shot down or crashed: back in the air 3 s later at the start slot farthest from the others. A kill counts for
  * whoever combat credits (a solo crash is only a death). Banner "1:42 · 2nd · 3 kills"; at 0:00 a leaderboard (most kills, then
  * fewest deaths) and game.finish with my place (top 3 = a win).
+ *
+ * Online (README "Online contract", lane NET): createChaosMode(game, { online: { host, minutes, bots, players, mySeat, view } }).
+ *   host:   the same match on seats 0..7 (fighter id = seat): humans from `players` (seat 0 = me, the others are remote players
+ *           flown from the network: game.spawnAI({ id, remote: true }), respawned with game.respawnRemote), AIs on every other
+ *           seat when `bots`; `minutes` long. mode.toAI(seat) (a player left: an AI takes the jet, score kept) and
+ *           mode.toHuman(seat, { name, color }) (a late joiner takes an AI's seat, or an empty one; its score starts at 0).
+ *   client: a view only: the clock, phase and every seat's kills / deaths come from the host's snapshots (`view`, netgame.js);
+ *           it shows the same cards, banner and leaderboard and finishes with MY place. Nothing here decides anything.
  */
 const ARENA_R = 3500;   // m: everyone starts on a ring this wide (the default ring is ~8 km: too far apart for 2 minutes)
 const COUNTDOWN = 2, MATCH_S = 120, RESPAWN_S = 3, RETARGET_S = 10, SWITCH_IF = 0.5, ME_BIAS = 0.7, N = 8;
@@ -32,9 +40,10 @@ const CSS = `
 `;
 
 /** @param {object} game  README `game` object */
-export function createChaosMode(game) {
-  const roster = [];   // [{ f, name, color, skill, kills, deaths, dead, deadT, retT, isMe }]
-  let phase = 'count', phaseT = 0, clock = MATCH_S, slots = [], board = null, saved = null;   // saved: combat's damage numbers, put back in stop()
+export function createChaosMode(game, { online = null } = {}) {
+  const roster = [];   // [{ f, name, color, skill, kills, deaths, dead, deadT, retT, isMe, remote?, seat? }]
+  const MATCH = online ? Math.round((online.minutes || 3) * 60) : MATCH_S, client = !!online && !online.host;
+  let phase = 'count', phaseT = 0, clock = MATCH, slots = [], board = null, saved = null;   // saved: combat's damage numbers, put back in stop()
   let shownSec = -1, shownPlace = -1, shownKills = -1;
 
   const byFighter = (id) => { for (let i = 0; i < roster.length; i++) if (roster[i].f.id === id) return roster[i]; return null; };
@@ -76,7 +85,7 @@ export function createChaosMode(game) {
   }
 
   function spawn(r, start) {
-    r.f = game.spawnAI({ ...start, skill: r.skill, name: r.name, color: r.color });
+    r.f = game.spawnAI({ ...start, skill: r.skill, name: r.name, color: r.color, id: r.seat, remote: r.remote });
     r.f.ai?.setPickups?.(items());
     r.dead = false; r.deadT = 0; r.retT = 0;
   }
@@ -89,7 +98,7 @@ export function createChaosMode(game) {
   }
 
   function banner() {
-    const me = roster[0], sec = Math.ceil(Math.max(0, clock)), place = placeOf(me);
+    const me = roster.find((r) => r.isMe), sec = Math.ceil(Math.max(0, clock)), place = placeOf(me);
     if (sec === shownSec && place === shownPlace && me.kills === shownKills) return;
     shownSec = sec; shownPlace = place; shownKills = me.kills;
     game.setBanner(`${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, '0')} · ${ord(place)} · ${plural(me.kills, 'kill')}`);
@@ -115,7 +124,7 @@ export function createChaosMode(game) {
 
   function end() {
     phase = 'over'; phaseT = 0;
-    const me = roster[0], place = placeOf(me);
+    const me = roster.find((r) => r.isMe), place = placeOf(me);
     const sorted = roster.slice().sort((a, b) => b.kills - a.kills || a.deaths - b.deaths || (b.isMe ? 1 : 0) - (a.isMe ? 1 : 0));
     showBoard(sorted);
     game.finish({ title: me.kills ? `${ord(place).toUpperCase()} PLACE` : 'NO KILLS', sub: `${plural(me.kills, 'kill')} · ${plural(me.deaths, 'death')}`, won: place <= 3 && me.kills > 0, place });   // 0 kills is never a W, even when ties put me 2nd
@@ -127,8 +136,9 @@ export function createChaosMode(game) {
     get kills() { return roster[0] ? roster[0].kills : 0; },
     get place() { return roster[0] ? placeOf(roster[0]) : 0; },
     start() {
+      if (client) { startClient(); return; }
       removeBoard();
-      for (let i = 1; i < roster.length; i++) game.despawn(roster[i].f);
+      for (let i = 1; i < roster.length; i++) if (roster[i].f) game.despawn(roster[i].f);
       roster.length = 0;
       slots = [];
       for (let k = 0; k < N; k++) slots.push(game.safeSpawn(k, N, ARENA_R));
@@ -139,7 +149,22 @@ export function createChaosMode(game) {
       const mine = String(me.color || '').toLowerCase(), cols = COLORS.filter((c) => c !== mine);
       const base = Math.max(0, SKILLS.indexOf(game.profile?.skill || 'medium'));
       const first = String(me.name || '').split(' ')[0], names = AI_NAMES.filter((n) => n !== first);   // no 'Ghost' next to 'Ghost 520'
-      for (let k = 1; k < N; k++) {
+      if (online) {   // seats: the humans where the room put them, AIs on the rest (if wanted)
+        const humans = new Map((online.players || []).filter((p) => p.seat > 0 && p.seat < N).map((p) => [p.seat, p]));
+        const taken = new Set([...humans.values()].map((p) => String(p.name || '').split(' ')[0]));
+        const aiNames = names.filter((n) => !taken.has(n));
+        for (let k = 1; k < N; k++) {
+          const p = humans.get(k);
+          if (!p && !online.bots) continue;
+          const r = { f: null, seat: k, remote: !!p, name: p ? p.name : aiNames[(k - 1) % aiNames.length], color: p ? p.color : cols[(k - 1) % cols.length],
+            skill: SKILLS[Math.min(2, Math.max(0, base + SKILL_MIX[k - 1]))], kills: 0, deaths: 0, dead: false, deadT: 0, retT: 0.4 * k, isMe: false };
+          spawn(r, slots[k]);
+          if (r.remote) game.respawnRemote(r.f, slots[k]);
+          r.retT = 0.4 * k;
+          roster.push(r);
+        }
+        game.netRoster?.();
+      } else for (let k = 1; k < N; k++) {
         const r = { f: null, name: names[(k - 1) % names.length], color: cols[(k - 1) % cols.length],
           skill: SKILLS[Math.min(2, Math.max(0, base + SKILL_MIX[k - 1]))], kills: 0, deaths: 0, dead: false, deadT: 0, retT: 0, isMe: false };
         spawn(r, slots[k]);
@@ -148,12 +173,13 @@ export function createChaosMode(game) {
       }
       const T = game.combat.TUNE; saved = saved || { m: T.mDamage, g: T.gunDamage };
       T.mDamage = MISSILE_DMG; T.gunDamage = saved.g * GUN_X;
-      phase = 'count'; phaseT = 0; clock = MATCH_S; shownSec = shownPlace = shownKills = -1;
+      phase = 'count'; phaseT = 0; clock = MATCH; shownSec = shownPlace = shownKills = -1;
       game.weaponsOff = true;
       banner();
-      game.cards.show('round', { text: 'CHAOS', sub: 'Everyone vs everyone · most kills in 2:00', ms: COUNTDOWN * 1000 });
+      game.cards.show('round', { text: online ? 'ONLINE CHAOS' : 'CHAOS', sub: `Everyone vs everyone · most kills in ${Math.floor(MATCH / 60)}:${String(MATCH % 60).padStart(2, '0')}`, ms: COUNTDOWN * 1000 });
     },
     step(dt) {
+      if (client) { stepClient(); return; }
       phaseT += dt;
       if (phase === 'count') {
         if (phaseT >= COUNTDOWN) { phase = 'fight'; phaseT = 0; game.weaponsOff = false; game.cards.show('round', { text: 'FIGHT!', ms: 900 }); }
@@ -166,11 +192,12 @@ export function createChaosMode(game) {
         if (r.dead || !f.alive) {
           if ((r.deadT += dt) >= RESPAWN_S) {
             if (r.isMe) { game.respawnMe(farthestSlot(f)); f.ai?.setPickups?.(items()); r.dead = false; r.deadT = 0; }   // (?bot: an AI flies me)
+            else if (r.remote) { game.respawnRemote(f, farthestSlot(f)); r.dead = false; r.deadT = 0; r.retT = 0; }   // the player places its own jet
             else { const at = farthestSlot(f); game.despawn(f); spawn(r, at); }
           }
           continue;
         }
-        if (!r.isMe && ((r.retT -= dt) <= 0 || !f.target || !f.target.alive)) retarget(r);
+        if (!r.isMe && !r.remote && ((r.retT -= dt) <= 0 || !f.target || !f.target.alive)) retarget(r);
       }
       banner();
       if (clock <= 0) end();
@@ -178,7 +205,7 @@ export function createChaosMode(game) {
     frame() {},
     /** kills (combat's credit) and deaths; a solo crash (killer -1 or the victim) is only a death */
     onEvent(e) {
-      if (e.type !== 'kill' || phase === 'over') return;
+      if (client || e.type !== 'kill' || phase === 'over') return;
       const v = byFighter(e.victim);
       if (v && !v.dead) { v.deaths++; v.dead = true; v.deadT = 0; }
       if (e.killer >= 0 && e.killer !== e.victim) { const k = byFighter(e.killer); if (k) k.kills++; }
@@ -186,12 +213,68 @@ export function createChaosMode(game) {
     stop() {
       removeBoard();
       if (saved) { game.combat.TUNE.mDamage = saved.m; game.combat.TUNE.gunDamage = saved.g; saved = null; }
-      for (let i = 1; i < roster.length; i++) { const f = roster[i].f; if (f) { f.target = null; game.despawn(f); } }
+      for (let i = 0; i < roster.length; i++) { const f = roster[i].f; if (f && !roster[i].isMe) { f.target = null; game.despawn(f); } }
       game.me.target = null;
       roster.length = 0;
       game.weaponsOff = false; game.setBanner(null);
       phase = 'count';
     },
+    /** online host: a player left; an AI flies its jet from here (the score stays with the seat) */
+    toAI(seat) {
+      const r = roster.find((x) => x.seat === seat && x.remote);
+      if (!r || !r.f) return;
+      r.remote = false; r.retT = 0;
+      game.setPilot(r.f, 'ai', r.skill || 'medium');
+      game.netRoster?.();
+    },
+    /** online host: a late joiner takes this seat (an AI's, or an empty one), score from 0, in the air at the farthest slot */
+    toHuman(seat, p) {
+      if (phase === 'over' || !online) return;
+      let r = roster.find((x) => x.seat === seat);
+      if (!r) { r = { f: null, seat, remote: true, name: p.name, color: p.color, skill: 'medium', kills: 0, deaths: 0, dead: false, deadT: 0, retT: 0, isMe: false }; roster.push(r); }
+      r.remote = true; r.name = p.name; r.color = p.color; r.kills = 0; r.deaths = 0; r.dead = false; r.deadT = 0;
+      const at = farthestSlot(r.f);
+      if (r.f) { game.despawn(r.f); r.f = null; }
+      spawn(r, at);
+      game.respawnRemote(r.f, at);
+      game.netRoster?.();
+    },
   };
+
+  // ---------------------------------------------------------------------------------- online client: a view of the host's match
+  const V = online && online.view;
+  function startClient() {
+    removeBoard();
+    roster.length = 0;
+    slots = [];
+    for (let k = 0; k < N; k++) slots.push(game.safeSpawn(k, N, ARENA_R));
+    game.respawnMe(slots[online.mySeat] || slots[0]);   // the host's respawn message places me for real
+    phase = 'count'; phaseT = 0; clock = MATCH; shownSec = shownPlace = shownKills = -1;
+    game.weaponsOff = true;
+    syncClient();
+    banner();
+    game.cards.show('round', { text: 'ONLINE CHAOS', sub: `Everyone vs everyone · most kills in ${Math.floor(MATCH / 60)}:${String(MATCH % 60).padStart(2, '0')}`, ms: COUNTDOWN * 1000 });
+  }
+  /** roster = the view's active seats (the same 8 objects, refreshed in place) */
+  function syncClient() {
+    roster.length = 0;
+    for (const s of V.seats) {
+      if (!s.active && !s.isMe) continue;
+      const r = s.r || (s.r = { f: null, name: '', color: '', kills: 0, deaths: 0, isMe: false, seat: s.seat });
+      r.f = s.isMe ? game.me : s.f; r.name = s.isMe ? game.me.name : s.name; r.color = s.isMe ? game.me.color : s.color;
+      r.kills = s.kills; r.deaths = s.deaths; r.isMe = s.isMe;
+      if (r.isMe) roster.unshift(r); else roster.push(r);
+    }
+  }
+  function stepClient() {
+    if (!V.have) return;
+    syncClient();
+    clock = V.clock;
+    if (phase === 'count' && V.phase !== 'count') { game.weaponsOff = false; game.cards.show('round', { text: 'FIGHT!', ms: 900 }); }
+    if (phase !== 'over') phase = V.phase === 'over' ? phase : V.phase;
+    game.weaponsOff = phase === 'count';
+    banner();
+    if (V.phase === 'over' && phase !== 'over') end();
+  }
   return mode;
 }

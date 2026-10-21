@@ -2,7 +2,7 @@
 // Style: one big PLAY button, white on translucent dark panels with backdrop blur, one accent (#ffb43a), the live 3D scene
 // visible behind. Everything is remembered in localStorage (try/catch: it works without it).
 //
-//   const menu = createMenu(rootDiv, { onPlay, onResume, onQuit, onSettings, onChange, onLocker });
+//   const menu = createMenu(rootDiv, { onPlay, onResume, onQuit, onSettings, onChange, onLocker, onFriends });
 //   menu.show('start' | 'pause' | 'none')
 //   menu.settings  { sensitivity (multiplier, 1 = default), invertY, volume (0..1), quality (0 low, 1 medium, 2 high), showFps, voice }
 //   menu.profile   { name, color ('#rrggbb'), skill ('easy'|'medium'|'hard'), mode ('duel'|'survival'|'race'|'tutorial'|'chaos') }
@@ -16,9 +16,12 @@
 // Lane UNLOCKS (README "Hooks contract"): settings.voice (announcer, default on); a side card on the start screen with level, rank,
 // XP bar, a LOCKER button (opts.onLocker) and today's 3 challenges, read from localStorage 'dogfight.progress.v1' through
 // progress.js (read-only here: the game's own instance is the one that saves) each time the start screen shows.
+// Lane LOBBY (README "Online contract"): a PLAY WITH FRIENDS button under PLAY (opts.onFriends: main.js opens lobby.js);
+// menu.setRoom(code|null) turns it into "BACK TO ROOM <code>" while still in a room; menu.save() persists a profile edited
+// elsewhere (the lobby); COLORS is exported for the lobby's colour row.
 
 const KEY = 'dogfight.menu.v1';
-const COLORS = [['#c8362c', 'Red'], ['#2b62cf', 'Blue'], ['#e0a020', 'Amber'], ['#3a9d5a', 'Green'], ['#8a4fd0', 'Violet'], ['#e7e7ea', 'White'], ['#2a2d33', 'Black'], ['#e0663a', 'Orange']];
+export const COLORS = [['#c8362c', 'Red'], ['#2b62cf', 'Blue'], ['#e0a020', 'Amber'], ['#3a9d5a', 'Green'], ['#8a4fd0', 'Violet'], ['#e7e7ea', 'White'], ['#2a2d33', 'Black'], ['#e0663a', 'Orange']];
 const SKILLS = [['easy', 'Easy'], ['medium', 'Medium'], ['hard', 'Hard']];
 const QUALITY = [['0', 'Low'], ['1', 'Medium'], ['2', 'High']];
 const MODES = [['duel', 'Duel', 'vs AI · best of 3'], ['chaos', 'Chaos', '2-min free-for-all'], ['survival', 'Survival', 'endless waves'], ['race', 'Ring race', 'fly the rings'], ['tutorial', 'First flight', 'learn the controls']];
@@ -61,6 +64,9 @@ const CSS = `
 .dfm .big:hover{filter:brightness(1.08)}
 .dfm .big:active{transform:translateY(4px);box-shadow:0 2px 0 #b9761a,0 6px 16px rgba(0,0,0,.35)}
 .dfm .big:focus-visible,.dfm .lnk:focus-visible,.dfm .sec:focus-visible,.dfm .tg:focus-visible{outline:3px solid #fff;outline-offset:3px}
+.dfm .frd{width:100%;font-weight:800;font-size:19px;letter-spacing:.1em;color:#fff;background:rgba(255,255,255,.1);border-radius:14px;padding:11px 0;
+  box-shadow:inset 0 0 0 2px #ffb43a;transition:background .12s;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.dfm .frd:hover{background:rgba(255,180,58,.22)}.dfm .frd:focus-visible{outline:3px solid #fff;outline-offset:3px}
 .dfm .sec{width:100%;font-weight:700;font-size:17px;color:#fff;background:rgba(255,255,255,.14);border-radius:12px;padding:12px 0}
 .dfm .sec:hover{background:rgba(255,255,255,.22)}
 .dfm .keys{text-wrap:balance;font-size:13px;opacity:.8;text-align:center;line-height:1.4;text-shadow:0 1px 6px rgba(0,0,0,.6)}
@@ -117,15 +123,15 @@ const CSS = `
 @media (max-width:640px){.dfm .side{flex-direction:column}}
 .dfm [hidden]{display:none!important}
 @media (max-height:800px){.dfm .scr{gap:10px;padding:10px 0}.dfm h1{font-size:54px}.dfm .pnl{padding:16px 22px;gap:11px}.dfm .lbl{margin-bottom:5px}.dfm .big{font-size:26px;padding:12px 0}
-  .dfm input[type=text]{padding:8px 12px}.dfm .sw label{width:34px;height:34px}.dfm .seg span{padding:7px 0}.dfm .modes span{padding:7px 4px}}
-@media (max-height:640px){.dfm .pnl{padding:14px 18px;gap:11px}.dfm .big{font-size:24px;padding:12px 0}.dfm h1{font-size:44px}}
+  .dfm input[type=text]{padding:8px 12px}.dfm .sw label{width:34px;height:34px}.dfm .seg span{padding:7px 0}.dfm .modes span{padding:7px 4px}.dfm .frd{font-size:17px;padding:9px 0}}
+@media (max-height:640px){.dfm .pnl{padding:14px 18px;gap:11px}.dfm .big{font-size:24px;padding:12px 0}.dfm h1{font-size:44px}.dfm .frd{padding:8px 0}}
 @media (max-height:540px){.dfm .scr{gap:6px;padding:8px 0}.dfm h1{font-size:34px}.dfm .pnl{padding:10px 16px;gap:7px;border-radius:16px}.dfm .lbl{font-size:10px;margin-bottom:3px}
   .dfm input[type=text]{font-size:15px;padding:5px 10px}.dfm .sw label{width:26px;height:26px}.dfm .sw i{border-width:2px}.dfm .seg span{padding:5px 0;font-size:13px}
   .dfm .modes b{font-size:14px}.dfm .modes small{font-size:10px}.dfm .modes span{padding:5px 3px;gap:1px}.dfm .big{font-size:20px;padding:8px 0;box-shadow:0 4px 0 #b9761a,0 8px 18px rgba(0,0,0,.35)}
-  .dfm .keys{display:none}.dfm .lnk{padding:2px 10px;font-size:13px}}
+  .dfm .keys{display:none}.dfm .lnk{padding:2px 10px;font-size:13px}.dfm .frd{font-size:14px;padding:5px 0;border-radius:11px}}
 `;
 
-/** @param {HTMLElement} root @param {{onPlay?:Function,onResume?:Function,onQuit?:Function,onSettings?:Function,onChange?:Function,onLocker?:Function}} [opts] */
+/** @param {HTMLElement} root @param {{onPlay?:Function,onResume?:Function,onQuit?:Function,onSettings?:Function,onChange?:Function,onLocker?:Function,onFriends?:Function}} [opts] */
 export function createMenu(root, opts = {}) {
   // ---- saved state (defaults when storage is missing / broken)
   let saved = {};
@@ -155,6 +161,7 @@ export function createMenu(root, opts = {}) {
       <div><div class="lbl">Mode</div><div class="modes">${MODES.map(([v, t, d]) => `<label><input type="radio" name="mode" value="${v}" aria-label="${t}"><span><b>${t}</b><small>${d}</small><em data-best="${v}" hidden></em></span>${v === 'tutorial' ? '<i data-new hidden>New? Start here</i>' : v === 'chaos' ? '<i class="nw">NEW</i>' : ''}</label>`).join('')}</div></div>
       <div data-skill><div class="lbl">AI skill</div>${radios('skill', SKILLS, profile.skill, 'seg')}</div>
       <button class="big" data-a="play">PLAY</button>
+      <button class="frd" data-a="friends">PLAY WITH FRIENDS</button>
       <div class="keys">Mouse aim · Click gun · Right-click / Space missile · F flares · W/S throttle · Shift afterburner · V view</div>
     </div>
     <div class="side" data-prog hidden>
@@ -234,7 +241,10 @@ export function createMenu(root, opts = {}) {
     } catch (e) { console.warn('menu: progress card', e); progEl.hidden = true; }
   }
 
-  const menu = { settings, profile, screen: 'none', onChange: opts.onChange || null, show, el: root };
+  const friendsEl = $('[data-a=friends]');
+  /** lane LOBBY: "BACK TO ROOM <code>" while in a room, else PLAY WITH FRIENDS */
+  const setRoom = (code) => { friendsEl.textContent = code ? `BACK TO ROOM ${code}` : 'PLAY WITH FRIENDS'; };
+  const menu = { settings, profile, screen: 'none', onChange: opts.onChange || null, show, el: root, save: persist, setRoom };
   let from = 'start';   // where Settings was opened from (Back returns there)
 
   const fire = () => { persist(); if (menu.onChange) menu.onChange(settings); };
@@ -248,7 +258,12 @@ export function createMenu(root, opts = {}) {
     const target = which === 'settings' ? 'settings' : which;
     for (const k in screens) screens[k].classList.toggle('on', k === target);
     root.hidden = which === 'none';
-    if (which === 'start') { if (!chosen) profile.mode = tutDone() ? 'duel' : 'tutorial'; syncMode(); syncProgress(); }
+    if (which === 'start') {
+      if (!chosen) profile.mode = tutDone() ? 'duel' : 'tutorial';
+      nameEl.value = profile.name;   // the lobby may have edited the name / colour
+      const c = root.querySelector(`input[name=color][value="${profile.color}"]`); if (c) c.checked = true;
+      syncMode(); syncProgress();
+    }
     if (which === 'start' || which === 'pause') { menu.screen = which; from = which; }
     else if (which === 'none') menu.screen = 'none';
     if (which !== 'none') { const b = screens[target].querySelector(target === 'settings' ? '[data-a=back]' : '.big'); if (b) b.focus({ preventScroll: true }); }
@@ -261,6 +276,7 @@ export function createMenu(root, opts = {}) {
     settings() { show('settings'); if (opts.onSettings) opts.onSettings(); },
     back() { show(from); },
     locker() { if (opts.onLocker) opts.onLocker(); },
+    friends() { profile.name = nameEl.value.trim().slice(0, 16) || profile.name; nameEl.value = profile.name; persist(); if (opts.onFriends) opts.onFriends(); },
   };
   root.addEventListener('click', (e) => { const b = e.target.closest('[data-a]'); if (b) act[b.dataset.a](); const t = e.target.closest('.tg'); if (t) { settings[t.dataset.k] = !settings[t.dataset.k]; sync(); fire(); } });
   root.addEventListener('input', (e) => {
@@ -275,7 +291,7 @@ export function createMenu(root, opts = {}) {
     else if (t.name === 'quality') { settings.quality = +t.value; fire(); }
   });
   addEventListener('keydown', (e) => {
-    if (root.hidden || e.repeat || document.querySelector('.dfl:not([hidden])')) return;   // the locker (z above) owns the keys while open
+    if (root.hidden || e.repeat || document.querySelector('.dfl:not([hidden]),.dfo:not([hidden])')) return;   // the locker / lobby (z above) own the keys while open
     const scr = root.querySelector('.scr.on').dataset.s, tag = e.target.tagName;
     if (e.code === 'Escape') { if (scr === 'settings') act.back(); else if (scr === 'pause') act.resume(); }
     else if ((e.code === 'Enter' || e.code === 'NumpadEnter') && tag !== 'BUTTON') { if (scr === 'start') act.play(); else if (scr === 'pause') act.resume(); else if (scr === 'settings') act.back(); }

@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lobby bench</title>
+<link href="https://fonts.googleapis.com/css2?family=Rubik:wght@500;700;800&display=swap" rel="stylesheet">
+<style>
+  html,body{margin:0;height:100%;overflow:hidden;background:linear-gradient(#e8a15e 0%,#7a6a8a 38%,#2a3550 55%,#1b2230 100%);font-family:Rubik,system-ui,sans-serif;color:#fff}
+  #bar{position:fixed;left:8px;bottom:8px;display:flex;flex-wrap:wrap;gap:6px;z-index:40;max-width:96vw}
+  #bar button{font:600 12px Rubik,system-ui,sans-serif;padding:6px 10px;border-radius:8px;border:0;background:rgba(0,0,0,.6);color:#fff;cursor:pointer}
+  #match{position:fixed;inset:0;display:none;align-items:center;justify-content:center;font:800 40px Rubik,sans-serif;letter-spacing:.1em}
+</style>
+</head>
+<body>
+<div id="menu"></div>
+<div id="match">MATCH RUNNING (bench)</div>
+<div id="bar"></div>
+<script type="module">
+// Lobby bench with a fake net (README "Online contract"). ?scn=choice|creating|host1|host4|client|join|notfound|full|started|failed|hostleft|lookalike
+// &nobar hides the buttons. window.__bench: { lobby, net, scn, add(), remove(), hostLeaves(), endMatch(), log }.
+import { createMenu } from './js/menu.js';
+import { createLobby } from './js/lobby.js';
+
+const P = new URLSearchParams(location.search);
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const scn = { delay: 700, hostErr: null, joinErr: null };
+const log = [];
+const FRIENDS = [['Viper 21', '#2b62cf'], ['Raven 88', '#3a9d5a'], ['Comet 512', '#8a4fd0'], ['Storm 7', '#e0663a'], ['Blaze 404', '#e7e7ea'], ['Hawk 5', '#e0a020'], ['Ghost 66', '#2a2d33']];
+
+/** The README net API, faked: host / join / start / leave, players with pings, onPlayers / onStart / onClose. */
+function createFakeNet() {
+  const net = {
+    code: null, isHost: false, seat: -1, players: [], onPlayers: null, onStart: null, onClose: null,
+    async host(me) {
+      await sleep(scn.delay);
+      if (scn.hostErr) throw { code: scn.hostErr };
+      Object.assign(net, { code: 'K7QPX', isHost: true, seat: 0, players: [{ seat: 0, ...me, ping: 0, isHost: true, isMe: true }] });
+      log.push('host'); return net.code;
+    },
+    async join(code, me) {
+      await sleep(scn.delay);
+      if (scn.joinErr) throw { code: scn.joinErr };
+      Object.assign(net, { code, isHost: false, seat: 3, players: [
+        { seat: 0, name: 'Maverick 77', color: '#2b62cf', ping: 0, isHost: true, isMe: false },
+        { seat: 1, name: 'Raven 88', color: '#3a9d5a', ping: 64, isHost: false, isMe: false },
+        { seat: 2, name: 'Comet 512', color: '#8a4fd0', ping: 141, isHost: false, isMe: false },
+        { seat: 3, ...me, ping: 48, isHost: false, isMe: true }] });
+      log.push(['join', code]);
+    },
+    start(cfg) { log.push(['start', cfg]); net.onStart?.({ ...cfg, seed: 7 }); },
+    leave() { log.push('leave'); Object.assign(net, { code: null, isHost: false, seat: -1, players: [] }); },
+  };
+  return net;
+}
+const net = createFakeNet();
+const fire = () => net.onPlayers?.(net.players);
+function add() {
+  const used = new Set(net.players.map((p) => p.seat)); let seat = 0; while (used.has(seat)) seat++;
+  if (seat >= 8) return;
+  const [name, color] = FRIENDS[(seat - 1 + 7) % 7];
+  net.players.push({ seat, name, color, ping: 30 + Math.round(Math.random() * 200), isHost: false, isMe: false }); fire();
+}
+function remove() { const i = net.players.findIndex((p) => !p.isMe && !p.isHost); if (i >= 0) { net.players.splice(i, 1); fire(); } }
+setInterval(() => { if (P.has('static')) return; for (const p of net.players) if (!p.isHost) p.ping = Math.max(12, p.ping + Math.round((Math.random() - 0.5) * 30)); fire(); }, 1000);
+
+const match = document.getElementById('match');
+const game = { playOnline(n, cfg) { log.push(['playOnline', cfg]); match.style.display = 'flex'; }, quit() { log.push('quit'); match.style.display = 'none'; menu.show('start'); } };
+const menu = createMenu(document.getElementById('menu'), { onPlay: () => log.push('play'), onFriends: () => lobby.open() });
+menu.show('start');
+const lobby = createLobby(document.body, { net, game, menu });
+const click = (a) => lobby.el.querySelector(`[data-a=${a}]`).click();
+const typeCode = (c) => { const i = lobby.el.querySelector('[data-k=code]'); i.value = c; i.dispatchEvent(new Event('input', { bubbles: true })); };
+const wait = () => sleep(scn.delay + 100);
+
+const SCN = {
+  choice: async () => lobby.open(),
+  creating: async () => { scn.delay = 1e9; lobby.open(); click('create'); },
+  host1: async () => { lobby.open(); click('create'); await wait(); },
+  host4: async () => { lobby.open(); click('create'); await wait(); add(); add(); add(); },
+  client: async () => { lobby.openJoin('K7QPX'); click('join'); await wait(); },
+  join: async () => lobby.openJoin('https://example.test/?room=k7-qpx'),
+  lookalike: async () => { lobby.open(); typeCode('K0QPL'); },
+  notfound: async () => { scn.joinErr = 'not-found'; lobby.openJoin('ABCDE'); click('join'); await wait(); },
+  full: async () => { scn.joinErr = 'full'; lobby.openJoin('ABCDE'); click('join'); await wait(); },
+  started: async () => { scn.joinErr = 'started'; lobby.openJoin('ABCDE'); click('join'); await wait(); },
+  failed: async () => { scn.joinErr = 'failed'; lobby.open(); typeCode('ABCDE'); click('join'); await wait(); },
+  hostleft: async () => { await SCN.client(); net.onClose?.('host-left'); },
+};
+const bar = document.getElementById('bar');
+if (P.has('nobar')) bar.style.display = 'none';
+const btn = (t, fn) => { const b = document.createElement('button'); b.textContent = t; b.onclick = fn; bar.appendChild(b); };
+btn('open', () => lobby.open()); btn('+ player', add); btn('- player', remove); btn('host leaves', () => net.onClose?.('host-left'));
+btn('end match → room', () => { match.style.display = 'none'; lobby.open(); });
+for (const k of ['notfound', 'full', 'failed']) btn(`err ${k}`, () => { scn.joinErr = { notfound: 'not-found' }[k] || k; });
+btn('errors off', () => { scn.joinErr = scn.hostErr = null; });
+
+window.__bench = { lobby, net, scn, add, remove, log, SCN, hostLeaves: () => net.onClose?.('host-left') };
+if (P.get('scn')) await SCN[P.get('scn')]();
+window.__ready = true;
+</script>
+</body>
+</html>
